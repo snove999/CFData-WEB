@@ -45,12 +45,12 @@ enum Backend {
 
     /// 启动（或在已退出时重启）后端；返回错误描述
     static func start() -> String? {
-        do {
-            try CfdatacoreStart(dataDirectory.path, backendPort)
+        // gomobile 导出的是 C 函数，Swift 不会自动转换为 throws，需要显式传入 NSError 指针
+        var error: NSError?
+        if CfdatacoreStart(dataDirectory.path, backendPort, &error) {
             return nil
-        } catch {
-            return error.localizedDescription
         }
+        return error?.localizedDescription ?? "后端启动失败"
     }
 }
 
