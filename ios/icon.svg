@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1e293b"/>
+      <stop offset="1" stop-color="#0b1120"/>
+    </linearGradient>
+    <linearGradient id="cloud" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffa53a"/>
+      <stop offset="1" stop-color="#f6821f"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#f6821f" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#f6821f" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <circle cx="512" cy="540" r="440" fill="url(#glow)"/>
+  <g transform="translate(0,30)">
+    <path fill="url(#cloud)" d="M300 700
+           C210 700 150 640 150 565
+           C150 492 205 436 276 430
+           C292 330 378 262 482 262
+           C572 262 648 314 682 392
+           C700 386 718 384 738 384
+           C820 384 880 448 880 530
+           C880 622 812 700 722 700 Z"/>
+    <path fill="#ffffff" d="M548 318 L398 540 L500 540 L460 720 L626 474 L522 474 Z"/>
+  </g>
+</svg>
