@@ -70,6 +70,9 @@ jobs:
           zip -qry release_assets/cfdata-ios-unsigned.ipa Payload
           cd release_assets && shasum -a 256 cfdata-ios-unsigned.ipa | awk '{print $1}' > cfdata-ios-unsigned.ipa.sha256
 
+      - name: Verify Icon
+        run: ls Payload/CFData.app | grep -E 'AppIcon|Assets.car'
+
       - uses: actions/upload-artifact@v7
         with:
           name: asset-ios-ipa
