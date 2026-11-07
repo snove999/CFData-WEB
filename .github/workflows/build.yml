@@ -211,99 +211,10 @@ jobs:
 
   ios-ipa:
     name: iOS IPA
-    runs-on: macos-15
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: combined_refactor/go.mod
-          cache-dependency-path: combined_refactor/go.sum
-
-      - name: Set Version
-        id: set-version
-        run: |
-          version="${{ github.event.inputs.version }}"
-          if [ -z "$version" ]; then
-            version="${{ github.ref_name }}"
-          fi
-          echo "VERSION=$version" >> $GITHUB_OUTPUT
-
-      - name: Download CA Certificates
-        run: |
-          curl -fsSL --retry 3 --connect-timeout 10 \
-            https://curl.se/ca/cacert.pem \
-            -o combined_refactor/ca-certificates.crt
-
-      - name: Prepare gomobile package (main -> library)
-        run: |
-          rm -rf build/cfdatacore && mkdir -p build
-          cp -R combined_refactor build/cfdatacore
-          cd build/cfdatacore
-          sed -i '' 's/^package main$/package cfdatacore/' *.go
-          sed -i '' 's/^func main() {$/func Main() {/' *.go
-          cp ../../ios/gomobile/mobile.go.in mobile.go
-          go get -tool golang.org/x/mobile/cmd/gobind@latest
-          go mod tidy
-
-      - name: Build xcframework
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest golang.org/x/mobile/cmd/gobind@latest
-          gomobile init
-          cd build/cfdatacore
-          gomobile bind -target=ios -iosversion=15.0 \
-            -ldflags "-s -w -X cfdata.appVersion=${{ steps.set-version.outputs.VERSION }}" \
-            -o ../../ios/Cfdatacore.xcframework .
-
-      - name: Generate App Icon
-        run: |
-          brew install librsvg
-          ICON_DIR=ios/CFData/Assets.xcassets/AppIcon.appiconset
-          mkdir -p "$ICON_DIR"
-          rsvg-convert -w 1024 -h 1024 -b "#0f172a" ios/icon.svg -o "$ICON_DIR/icon-1024.png"
-          cat > ios/CFData/Assets.xcassets/Contents.json <<'EOF'
-          { "info": { "author": "xcode", "version": 1 } }
-          EOF
-          cat > "$ICON_DIR/Contents.json" <<'EOF'
-          {
-            "images": [
-              { "filename": "icon-1024.png", "idiom": "universal", "platform": "ios", "size": "1024x1024" }
-            ],
-            "info": { "author": "xcode", "version": 1 }
-          }
-          EOF
-
-      - name: Generate Xcode project
-        run: |
-          brew install xcodegen
-          cd ios && xcodegen generate
-
-      - name: Build app (unsigned)
-        run: |
-          xcodebuild -project ios/CFData.xcodeproj -scheme CFData \
-            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
-            -derivedDataPath build/dd \
-            MARKETING_VERSION="${VERSION#v}" \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build
-        env:
-          VERSION: ${{ steps.set-version.outputs.VERSION }}
-
-      - name: Package IPA
-        run: |
-          mkdir -p release_assets Payload
-          cp -R build/dd/Build/Products/Release-iphoneos/CFData.app Payload/
-          zip -qry release_assets/cfdata-ios-arm64-unsigned.ipa Payload
-          cd release_assets
-          shasum -a 256 cfdata-ios-arm64-unsigned.ipa | awk '{print $1}' > cfdata-ios-arm64-unsigned.ipa.sha256
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: asset-ios-ipa
-          path: release_assets/*
+    # 复用 ios.yml，单独构建与发布构建共用同一份步骤；失败时不发布 Release
+    uses: ./.github/workflows/ios.yml
+    with:
+      version: ${{ github.event.inputs.version }}
 
   release:
     name: Release
