@@ -7,8 +7,6 @@ on:
         description: "Version"
         required: false
         default: "v1.0"
-  push:
-    tags: ["v*"]
 
 jobs:
   ios-ipa:
