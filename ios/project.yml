@@ -1,0 +1,33 @@
+name: CFData
+options:
+  bundleIdPrefix: com.cfdata
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  CFData:
+    type: application
+    platform: iOS
+    sources: [CFData]
+    dependencies:
+      - framework: Cfdatacore.xcframework
+        embed: false          # gomobile 产物是静态库
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cfdata.web
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        OTHER_LDFLAGS: ["-lresolv"]
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: CFData/Info.plist
+      properties:
+        CFBundleDisplayName: CFData
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true              # 在“文件”App 里可见配置文件
+        LSSupportsOpeningDocumentsInPlace: true
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true         # 允许 http://127.0.0.1
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
