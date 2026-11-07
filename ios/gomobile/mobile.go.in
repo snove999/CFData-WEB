@@ -1,0 +1,20 @@
+package cfdatacore
+
+import (
+	"os"
+	"strconv"
+	"sync"
+)
+
+var startOnce sync.Once
+
+// Start 在 iOS App 进程内启动 Web 服务（只会启动一次）
+func Start(dataDir string, port int) {
+	startOnce.Do(func() {
+		_ = os.MkdirAll(dataDir, 0o755)
+		_ = os.Chdir(dataDir) // 配置/数据文件使用相对路径
+		os.Setenv("NO_COLOR", "1")
+		os.Args = []string{"cfdata", "-host", "127.0.0.1", "-port", strconv.Itoa(port)}
+		go Main()
+	})
+}
