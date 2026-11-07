@@ -36,7 +36,7 @@ CFData-Web 是一个基于 Go 的 Cloudflare IP 测试与筛选工具，提供�
 
 ## 快速开始
 
-从 [Releases](https://github.com/PoemMisty/CFData-WEB/releases/latest) 下载对应平台程序后运行。
+从 [Releases](https://github.com/snove999/CFData-WEB/releases/latest) 下载对应平台程序后运行。
 
 默认启动 Web 模式：
 
