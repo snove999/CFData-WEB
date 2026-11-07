@@ -1,0 +1,76 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version"
+        required: false
+        default: "v1.0"
+  push:
+    tags: ["v*"]
+
+jobs:
+  ios-ipa:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: combined_refactor/go.mod
+          cache-dependency-path: combined_refactor/go.sum
+
+      - name: Set Version
+        id: v
+        run: |
+          v="${{ github.event.inputs.version }}"; [ -z "$v" ] && v="${{ github.ref_name }}"
+          echo "VERSION=$v" >> $GITHUB_OUTPUT
+
+      - name: Download CA Certificates
+        run: curl -fsSL --retry 3 https://curl.se/ca/cacert.pem -o combined_refactor/ca-certificates.crt
+
+      - name: Prepare gomobile package (main -> library)
+        run: |
+          rm -rf build/cfdatacore && mkdir -p build
+          cp -R combined_refactor build/cfdatacore
+          cd build/cfdatacore
+          sed -i '' 's/^package main$/package cfdatacore/' *.go
+          sed -i '' 's/^func main() {$/func Main() {/' *.go
+          cp ../../ios/gomobile/mobile.go.in mobile.go
+          go get golang.org/x/mobile/bind@latest
+          go mod tidy
+
+      - name: Build xcframework
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest golang.org/x/mobile/cmd/gobind@latest
+          gomobile init
+          cd build/cfdatacore
+          gomobile bind -target=ios -iosversion=15.0 \
+            -ldflags "-s -w -X cfdata.appVersion=${{ steps.v.outputs.VERSION }}" \
+            -o ../../ios/Cfdatacore.xcframework .
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          cd ios && xcodegen generate
+
+      - name: Build app (unsigned)
+        run: |
+          xcodebuild -project ios/CFData.xcodeproj -scheme CFData \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p release_assets Payload
+          cp -R build/dd/Build/Products/Release-iphoneos/CFData.app Payload/
+          zip -qry release_assets/cfdata-ios-unsigned.ipa Payload
+          cd release_assets && shasum -a 256 cfdata-ios-unsigned.ipa | awk '{print $1}' > cfdata-ios-unsigned.ipa.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: asset-ios-ipa
+          path: release_assets/*
