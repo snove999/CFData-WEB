@@ -38,7 +38,7 @@ jobs:
           sed -i '' 's/^package main$/package cfdatacore/' *.go
           sed -i '' 's/^func main() {$/func Main() {/' *.go
           cp ../../ios/gomobile/mobile.go.in mobile.go
-          go get golang.org/x/mobile/bind@latest
+          go get -tool golang.org/x/mobile/cmd/gobind@latest
           go mod tidy
 
       - name: Build xcframework
