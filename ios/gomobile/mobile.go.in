@@ -1,20 +1,82 @@
 package cfdatacore
 
 import (
+	"flag"
+	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
-var startOnce sync.Once
+var (
+	stateMu sync.Mutex
+	running bool
+	exitErr string
+)
 
-// Start 在 iOS App 进程内启动 Web 服务（只会启动一次）
-func Start(dataDir string, port int) {
-	startOnce.Do(func() {
-		_ = os.MkdirAll(dataDir, 0o755)
-		_ = os.Chdir(dataDir) // 配置/数据文件使用相对路径
-		os.Setenv("NO_COLOR", "1")
-		os.Args = []string{"cfdata", "-host", "127.0.0.1", "-port", strconv.Itoa(port)}
-		go Main()
-	})
+// Start 在 iOS App 进程内启动 Web 服务。
+// dataDir 必须是 App 沙盒内可写目录。若后端仍在运行则直接返回；
+// 若上一次已退出（例如 App 挂起后监听 socket 被系统回收），会重新启动。
+func Start(dataDir string, port int) error {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if running {
+		return nil
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return fmt.Errorf("创建数据目录失败: %w", err)
+	}
+	// 数据文件使用相对路径；配置文件通过 CFDATA_DATA_DIR 定位
+	if err := os.Chdir(dataDir); err != nil {
+		return fmt.Errorf("切换数据目录失败: %w", err)
+	}
+	_ = os.Setenv("CFDATA_DATA_DIR", dataDir)
+	_ = os.Setenv("NO_COLOR", "1")
+	os.Args = []string{"cfdata", "-host", "127.0.0.1", "-port", strconv.Itoa(port)}
+	// Main 会在全局 FlagSet / DefaultServeMux 上注册，重启前需重置以免重复注册 panic
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	http.DefaultServeMux = http.NewServeMux()
+	running = true
+	exitErr = ""
+	go func() {
+		msg := "后端服务已退出"
+		defer func() {
+			if r := recover(); r != nil {
+				msg = fmt.Sprintf("后端服务崩溃: %v", r)
+			}
+			stateMu.Lock()
+			running = false
+			exitErr = msg
+			stateMu.Unlock()
+		}()
+		Main()
+	}()
+	return nil
+}
+
+// IsReady 检测后端端口是否已可连接
+func IsReady(port int) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// IsRunning 返回后端 goroutine 是否仍在运行
+func IsRunning() bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	return running
+}
+
+// LastError 返回后端最近一次退出的原因；为空表示未退出过
+func LastError() string {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	return exitErr
 }

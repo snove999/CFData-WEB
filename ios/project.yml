@@ -7,29 +7,34 @@ targets:
   CFData:
     type: application
     platform: iOS
-    sources: [CFData]
+    sources: [CFData]               # 包含 Assets.xcassets（图标已入库，无需 CI 生成）
     dependencies:
       - framework: Cfdatacore.xcframework
-        embed: false          # gomobile 产物是静态库
+        embed: false                # gomobile 产物是静态库
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cfdata.web
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.0"    # CI 通过 xcodebuild 参数覆盖为发布版本号
+        CURRENT_PROJECT_VERSION: "1" # CI 通过 xcodebuild 参数覆盖为 run_number
         OTHER_LDFLAGS: ["-lresolv"]
         TARGETED_DEVICE_FAMILY: "1,2"
-        
+
     info:
       path: CFData/Info.plist
       properties:
         CFBundleDisplayName: CFData
         UILaunchScreen: {}
-        UIFileSharingEnabled: true              # 在“文件”App 里可见配置文件
-        LSSupportsOpeningDocumentsInPlace: true
+        # 数据存放于 Application Support（私有），不开启“文件”App 共享，避免暴露配置中的 Token
         NSAppTransportSecurity:
-          NSAllowsLocalNetworking: true         # 允许 http://127.0.0.1
+          NSAllowsLocalNetworking: true # 允许 http://127.0.0.1
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # iPad 支持分屏多任务需声明全部方向，否则 Xcode 警告
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight

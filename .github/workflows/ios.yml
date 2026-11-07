@@ -7,26 +7,61 @@ on:
         description: "Version"
         required: false
         default: "v1.0"
+        type: string
+  # 供 build.yml 复用，保证单独构建与发布构建完全一致
+  workflow_call:
+    inputs:
+      version:
+        description: "Version"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # 固定 gomobile 版本，保证构建可复现；升级时只改这里
+  GOMOBILE_VERSION: v0.0.0-20261011034528-197770444867
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
 
 jobs:
   ios-ipa:
+    name: iOS IPA
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout code
+        uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - name: Setup Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: combined_refactor/go.mod
           cache-dependency-path: combined_refactor/go.sum
 
       - name: Set Version
         id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          v="${{ github.event.inputs.version }}"; [ -z "$v" ] && v="${{ github.ref_name }}"
-          echo "VERSION=$v" >> $GITHUB_OUTPUT
+          v="$INPUT_VERSION"
+          [ -z "$v" ] && v="$REF_NAME"
+          # CFBundleShortVersionString 只接受 1~3 段数字：去掉 v 前缀和 -beta 等后缀
+          mv="${v#v}"; mv="${mv%%-*}"
+          if ! printf '%s' "$mv" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "::warning::版本号 '$v' 无法用作 iOS 版本，回退为 1.0"
+            mv="1.0"
+          fi
+          echo "VERSION=$v" >> "$GITHUB_OUTPUT"
+          echo "MARKETING_VERSION=$mv" >> "$GITHUB_OUTPUT"
 
       - name: Download CA Certificates
-        run: curl -fsSL --retry 3 https://curl.se/ca/cacert.pem -o combined_refactor/ca-certificates.crt
+        run: |
+          curl -fsSL --retry 3 --connect-timeout 10 \
+            https://curl.se/ca/cacert.pem \
+            -o combined_refactor/ca-certificates.crt
 
       - name: Prepare gomobile package (main -> library)
         run: |
@@ -35,36 +70,29 @@ jobs:
           cd build/cfdatacore
           sed -i '' 's/^package main$/package cfdatacore/' *.go
           sed -i '' 's/^func main() {$/func Main() {/' *.go
+          # 上游若改动 main 的写法，sed 会静默失效，这里显式校验
+          if grep -l '^package main$' *.go; then
+            echo "::error::仍有文件声明 package main，main -> library 转换失败"; exit 1
+          fi
+          if [ "$(grep -l '^func Main() {$' *.go | wc -l | tr -d ' ')" != "1" ]; then
+            echo "::error::未找到唯一的 func Main()，上游入口函数写法可能已变化"; exit 1
+          fi
           cp ../../ios/gomobile/mobile.go.in mobile.go
-          go get -tool golang.org/x/mobile/cmd/gobind@latest
+          # gomobile bind 生成的代码依赖 golang.org/x/mobile/bind，需要作为模块依赖保留（-tool 防止被 tidy 移除）
+          go get -tool "golang.org/x/mobile/cmd/gobind@${GOMOBILE_VERSION}"
           go mod tidy
 
       - name: Build xcframework
+        env:
+          VERSION: ${{ steps.v.outputs.VERSION }}
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest golang.org/x/mobile/cmd/gobind@latest
+          go install "golang.org/x/mobile/cmd/gomobile@${GOMOBILE_VERSION}" "golang.org/x/mobile/cmd/gobind@${GOMOBILE_VERSION}"
           gomobile init
           cd build/cfdatacore
+          # 模块路径为 cfdata，转换后包导入路径即 cfdata
           gomobile bind -target=ios -iosversion=15.0 \
-            -ldflags "-s -w -X cfdata.appVersion=${{ steps.v.outputs.VERSION }}" \
+            -ldflags "-s -w -X cfdata.appVersion=${VERSION}" \
             -o ../../ios/Cfdatacore.xcframework .
-
-      - name: Generate App Icon
-        run: |
-          brew install librsvg
-          ICON_DIR=ios/CFData/Assets.xcassets/AppIcon.appiconset
-          mkdir -p "$ICON_DIR"
-          rsvg-convert -w 1024 -h 1024 -b "#0f172a" ios/icon.svg -o "$ICON_DIR/icon-1024.png"
-          cat > ios/CFData/Assets.xcassets/Contents.json <<'EOF'
-          { "info": { "author": "xcode", "version": 1 } }
-          EOF
-          cat > "$ICON_DIR/Contents.json" <<'EOF'
-          {
-            "images": [
-              { "filename": "icon-1024.png", "idiom": "universal", "platform": "ios", "size": "1024x1024" }
-            ],
-            "info": { "author": "xcode", "version": 1 }
-          }
-          EOF
 
       - name: Generate Xcode project
         run: |
@@ -72,24 +100,32 @@ jobs:
           cd ios && xcodegen generate
 
       - name: Build app (unsigned)
+        env:
+          MARKETING_VERSION: ${{ steps.v.outputs.MARKETING_VERSION }}
+          BUILD_NUMBER: ${{ github.run_number }}
         run: |
           xcodebuild -project ios/CFData.xcodeproj -scheme CFData \
             -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath build/dd \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             build
 
       - name: Package IPA
         run: |
-          mkdir -p release_assets Payload
-          cp -R build/dd/Build/Products/Release-iphoneos/CFData.app Payload/
-          zip -qry release_assets/cfdata-ios-unsigned.ipa Payload
-          cd release_assets && shasum -a 256 cfdata-ios-unsigned.ipa | awk '{print $1}' > cfdata-ios-unsigned.ipa.sha256
+          APP=build/dd/Build/Products/Release-iphoneos/CFData.app
+          # 校验图标与版本号已正确写入
+          ls "$APP" | grep -E 'AppIcon|Assets.car'
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' -c 'Print :CFBundleVersion' "$APP/Info.plist"
+          rm -rf Payload && mkdir -p release_assets Payload
+          cp -R "$APP" Payload/
+          zip -qry release_assets/cfdata-ios-arm64-unsigned.ipa Payload
+          cd release_assets
+          shasum -a 256 cfdata-ios-arm64-unsigned.ipa | awk '{print $1}' > cfdata-ios-arm64-unsigned.ipa.sha256
 
-      - name: Verify Icon
-        run: ls Payload/CFData.app | grep -E 'AppIcon|Assets.car'
-
-      - uses: actions/upload-artifact@v7
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
         with:
           name: asset-ios-ipa
           path: release_assets/*

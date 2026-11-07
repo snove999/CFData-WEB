@@ -948,6 +948,10 @@ func applyCLIFileConfig(cfg *cliConfig, fileCfg cliFileConfig, provided map[stri
 }
 
 func defaultCLIConfigPath() string {
+	// 移动端（如 iOS）可执行文件所在目录只读，允许通过环境变量指定可写数据目录
+	if dir := strings.TrimSpace(os.Getenv("CFDATA_DATA_DIR")); dir != "" {
+		return filepath.Join(dir, "cfdata-config.json")
+	}
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
 		return "cfdata-config.json"

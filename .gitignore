@@ -27,6 +27,9 @@ cfdata
 cfdata-*
 !app/src/main/java/com/cfdata/
 !app/src/main/java/com/cfdata/**
+# 大小写不敏感的文件系统上 cfdata 规则会误伤 iOS 工程目录 ios/CFData
+!ios/CFData/
+!ios/CFData/**
 combined_refactor/cfdata
 combined_refactor/cfdata-*
 cfdata-config.json
