@@ -190,15 +190,20 @@ func main() {
 	configureHTTPClients()
 	startupSpeedTestURL := speedTestURL
 	if !cliCfg.enabled {
-		ensureSpeedURLAvailability()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		resolvedSpeedURL, speedISP, err := resolveStartupSpeedTestURL(ctx, speedTestURL)
-		cancel()
-		if err != nil {
-			recordDebugError("speed_isp_check", err.Error())
+		if os.Getenv("CFDATA_IOS") == "1" {
+			// iOS 首屏不等待外网测速源探测；测速源在首次实际测速时按需选择。
+			setAutoSpeedURLDefault(cloudflareSpeedURL)
 		} else {
-			startupSpeedTestURL = resolvedSpeedURL
-			recordDebugByLevel("all", "speed_isp_check", fmt.Sprintf("startup asn=%d org=%s mobile=%v selected=%s", speedISP.ASN, speedISP.ASOrganization, isChinaMobileISP(speedISP), currentAutoSpeedURLDefault()))
+			ensureSpeedURLAvailability()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			resolvedSpeedURL, speedISP, err := resolveStartupSpeedTestURL(ctx, speedTestURL)
+			cancel()
+			if err != nil {
+				recordDebugError("speed_isp_check", err.Error())
+			} else {
+				startupSpeedTestURL = resolvedSpeedURL
+				recordDebugByLevel("all", "speed_isp_check", fmt.Sprintf("startup asn=%d org=%s mobile=%v selected=%s", speedISP.ASN, speedISP.ASOrganization, isChinaMobileISP(speedISP), currentAutoSpeedURLDefault()))
+			}
 		}
 	}
 	if webSessionMinutes <= 0 {
@@ -215,7 +220,12 @@ func main() {
 		}
 		applyManagementProxyFromConfigFile(cfgPath)
 	}
-	initLocations()
+	if os.Getenv("CFDATA_IOS") == "1" {
+		// locations 只影响地区名称展示，不应阻塞 iOS 本地 HTTP 服务启动。
+		go initLocations()
+	} else {
+		initLocations()
+	}
 	if cliCfg.enabled {
 		if enterMenu {
 			runCLIMenu(cliCfg)
