@@ -3106,10 +3106,16 @@
             compactHitBuffer = [];
         }
 
+        let reconnectTimer = null;
+        let reconnecting = false;
+
         function connect() {
+            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
             ws.onopen = () => {
+                reconnecting = false;
                 updateStatus('已连接服务器', true);
                 log('已连接服务器');
                 initThemeFromStorage();
@@ -3131,11 +3137,29 @@
                 } else if (isTaskRunning || officialBatchSpeedRunning || isStoppingTask) {
                     resetStoppedTaskUI('连接断开，当前任务状态已重置');
                 }
-                updateStatus('连接断开，3秒后重连...', false);
+                updateStatus('连接断开，正在重连...', false);
                 log('连接断开，正在重连...');
-                setTimeout(connect, 3000);
+                if (!reconnecting) {
+                    reconnecting = true;
+                    reconnectTimer = setTimeout(() => { reconnecting = false; connect(); }, 3000);
+                }
             };
         }
+
+        // iOS 从后台恢复时立即重连，不等待后台期间被节流的 3 秒定时器。
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') return;
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            reconnecting = false;
+            // 后台恢复时主动丢弃旧 WebSocket，避免系统仍报告 OPEN、实际链路已失效。
+            if (ws) {
+                const staleSocket = ws;
+                ws = null;
+                staleSocket.onclose = null;
+                staleSocket.close();
+            }
+            connect();
+        });
 
         function updateStatus(text, connected) {
             statusEl.textContent = text;
