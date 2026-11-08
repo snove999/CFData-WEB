@@ -34,6 +34,7 @@ func Start(dataDir string, port int) error {
 		return fmt.Errorf("切换数据目录失败: %w", err)
 	}
 	_ = os.Setenv("CFDATA_DATA_DIR", dataDir)
+	_ = os.Setenv("CFDATA_IOS", "1")
 	_ = os.Setenv("NO_COLOR", "1")
 	os.Args = []string{"cfdata", "-host", "127.0.0.1", "-port", strconv.Itoa(port)}
 	// Main 会在全局 FlagSet / DefaultServeMux 上注册，重启前需重置以免重复注册 panic
