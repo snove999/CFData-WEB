@@ -3108,6 +3108,7 @@
 
         let reconnectTimer = null;
         let reconnecting = false;
+        let hasConnectedBefore = false;
 
         function connect() {
             if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
@@ -3116,6 +3117,27 @@
             ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
             ws.onopen = () => {
                 reconnecting = false;
+                if (hasConnectedBefore) {
+                    // WebSocket 重连会创建新的后端 appSession，旧会话中的扫描 IP 已不可用。
+                    // 清除旧数据中心和测速结果，避免用旧列表向新会话发起详细测试。
+                    scanData = [];
+                    testData = [];
+                    dcList = [];
+                    testedDCs.clear();
+                    currentTestingDC = '';
+                    scanResultsCount = 0;
+                    testResultsCount = 0;
+                    updateBadge('scanCount', 0);
+                    updateBadge('testCount', 0);
+                    updateBadge('dcCount', 0);
+                    document.querySelector('#scanTable tbody').innerHTML = '';
+                    document.querySelector('#dcTable tbody').innerHTML = '';
+                    document.querySelector('#testTable tbody').innerHTML = '';
+                    document.getElementById('dcSection').style.display = 'none';
+                    finishRunningTask('✨ 开始扫描与测试');
+                    log('连接已恢复；旧会话数据已清除，请重新扫描');
+                }
+                hasConnectedBefore = true;
                 updateStatus('已连接服务器', true);
                 log('已连接服务器');
                 initThemeFromStorage();
@@ -3150,14 +3172,11 @@
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState !== 'visible') return;
             if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            // 不主动关闭仍处于 OPEN/CONNECTING 的连接，否则会无故创建新后端会话，
+            // 使原会话的扫描 IP 失效。已关闭或正在关闭时才立即重连。
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
             reconnecting = false;
-            // 后台恢复时主动丢弃旧 WebSocket，避免系统仍报告 OPEN、实际链路已失效。
-            if (ws) {
-                const staleSocket = ws;
-                ws = null;
-                staleSocket.onclose = null;
-                staleSocket.close();
-            }
+            ws = null;
             connect();
         });
 
