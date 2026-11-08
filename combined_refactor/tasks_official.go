@@ -79,7 +79,7 @@ func scanOfficialIP(ctx context.Context, ip string, port int, delay int) (*ScanR
 		return nil, "trace_missing_colo", strings.TrimSpace(bodyStr)
 	}
 
-	loc := locationMap[dataCenter]
+	loc := lookupLocation(dataCenter)
 	res := &ScanResult{
 		IP:          ip,
 		Port:        port,
@@ -170,7 +170,7 @@ func scanOfficialHTTP(ctx context.Context, ip string, port int, delay int) (*Sca
 		return nil, "trace_missing_colo", strings.TrimSpace(bodyStr)
 	}
 
-	loc := locationMap[dataCenter]
+	loc := lookupLocation(dataCenter)
 	res := &ScanResult{
 		IP:          ip,
 		Port:        port,
