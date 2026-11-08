@@ -282,7 +282,8 @@ type backgroundTaskSnapshot struct {
 type taskStarter func(ctx context.Context, session *appSession)
 
 var (
-	locationMap map[string]location
+	locationMap   map[string]location
+	locationMapMu sync.RWMutex
 
 	upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
