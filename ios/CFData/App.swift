@@ -146,7 +146,7 @@ final class WebViewController: UIViewController {
                     self.statusView.showFailure("后端服务启动超时，请检查网络后重试")
                     return
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                     self.waitForBackend(generation: generation, deadline: deadline, allowRestart: allowRestart)
                 }
             }
@@ -168,8 +168,14 @@ final class WebViewController: UIViewController {
     }
 
     @objc private func appDidEnterBackground() {
-        // 扫描进行中时申请有限的后台执行时间，降低被立即挂起导致中断的概率
-        guard isBusy, backgroundTask == .invalid else { return }
+        // 扫描进行中时申请有限的后台执行时间，降低被立即挂起导致中断的概率。
+        // 正常情况下会在收到 busy=true 时提前申请，这里作为兜底。
+        guard isBusy else { return }
+        beginBackgroundTaskIfNeeded()
+    }
+
+    private func beginBackgroundTaskIfNeeded() {
+        guard backgroundTask == .invalid else { return }
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "CFDataScan") { [weak self] in
             self?.endBackgroundTask()
         }
@@ -270,7 +276,12 @@ extension WebViewController: WKScriptMessageHandler {
         case "busy":
             isBusy = body["busy"] as? Bool ?? false
             UIApplication.shared.isIdleTimerDisabled = isBusy   // 仅扫描期间防止锁屏
-            if !isBusy { endBackgroundTask() }
+            if isBusy {
+                // 在前台任务刚开始时就申请后台时间，避免等到进入后台才申请过晚。
+                beginBackgroundTaskIfNeeded()
+            } else {
+                endBackgroundTask()
+            }
         default:
             break
         }
