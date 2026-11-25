@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,8 @@ var (
 	stateMu sync.Mutex
 	running bool
 	exitErr string
+	// backendStartSeq 为后端实际启动次数（单调递增），仅用于第一阶段性能日志中的启动代次。
+	backendStartSeq int64
 )
 
 // Start 在 iOS App 进程内启动 Web 服务。
@@ -24,13 +27,21 @@ func Start(dataDir string, port int) error {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	if running {
+		// 第一阶段仅加日志：已在运行直接返回的行为不变。
+		perfLogLine("backend_start_skipped", "already_running")
 		return nil
 	}
+	// 第二阶段修正：每次实际启动（非已运行直接返回）都在这里初始化为 starting，
+	// 清除上一次的失败状态；Main() 入口也会再置一次 starting（桌面端直接运行的路径）。
+	// Main() 是 main.go 中 func main() 经 iOS 构建转换后的名字（见 ios.yml 的 sed）。
+	setBackendHealthStatus("starting", "")
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		setBackendHealthStatus("failed", err.Error())
 		return fmt.Errorf("创建数据目录失败: %w", err)
 	}
 	// 数据文件使用相对路径；配置文件通过 CFDATA_DATA_DIR 定位
 	if err := os.Chdir(dataDir); err != nil {
+		setBackendHealthStatus("failed", err.Error())
 		return fmt.Errorf("切换数据目录失败: %w", err)
 	}
 	_ = os.Setenv("CFDATA_DATA_DIR", dataDir)
@@ -42,6 +53,9 @@ func Start(dataDir string, port int) error {
 	http.DefaultServeMux = http.NewServeMux()
 	running = true
 	exitErr = ""
+	// 第一阶段仅加日志：perfLogLine 定义在同包的 session.go 中。
+	gen := atomic.AddInt64(&backendStartSeq, 1)
+	perfLogLine("backend_start", fmt.Sprintf("backend_gen=%d port=%d data_dir=%s", gen, port, dataDir))
 	go func() {
 		msg := "后端服务已退出"
 		defer func() {
@@ -52,6 +66,15 @@ func Start(dataDir string, port int) error {
 			running = false
 			exitErr = msg
 			stateMu.Unlock()
+			// 第二阶段修正：Main() 已退出时，若健康状态仍为 starting 或 ready，置为 failed；
+			// 若状态已为 failed（Main() 已写了更具体的失败原因），noteBackendExited 不会覆盖它。
+			noteBackendExited(msg)
+			perfLogLine("backend_exit", fmt.Sprintf("backend_gen=%d err=%s", gen, msg))
+			// R3 §16.3 testMainExitedHook：Main() 已完全退出后调用（生产恒 nil），
+			// 作为“Main() 已完全退出”的确定性信号（见 §8.1/T38 M1）。
+			if h := testHookGet(&testMainExitedHook); h != nil {
+				h()
+			}
 		}()
 		Main()
 	}()

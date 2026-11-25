@@ -785,7 +785,7 @@ func runNSBTask(ctx context.Context, session *appSession, fileName, fileContent,
 		nsbResults = append(nsbResults, *res)
 		accepted := len(nsbResults)
 		resMutex.Unlock()
-		session.sendWSMessage("nsb_scan_result", res.toNSBLiveMessage("", compact))
+		session.sendTaskResult(ctx, "nsb_scan_result", res.toNSBLiveMessage("", compact))
 		return accepted
 	})
 
@@ -843,7 +843,7 @@ func runNSBTask(ctx context.Context, session *appSession, fileName, fileContent,
 			reportNSBProgress(session, "speed", min(qualified, speedLimit), speedLimit, "测速中")
 		}, func(idx int, speedErr string) {
 			res := &nsbResults[idx]
-			session.sendWSMessage("nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
+			session.sendTaskResult(ctx, "nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
 			if debugMode && speedErr != "" {
 				failMutex.Lock()
 				failures = append(failures, nsbFailureRecord{
@@ -1064,7 +1064,7 @@ func runNSBReallinkTask(ctx context.Context, session *appSession, rows []nsbScan
 			reportNSBProgress(session, "speed", min(qualified, speedLimit), speedLimit, "测速中")
 		}, func(idx int, speedErr string) {
 			res := &results[idx]
-			session.sendWSMessage("nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
+			session.sendTaskResult(ctx, "nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
 		}, func(idx int) (float64, string) {
 			res := &results[idx]
 			return runNSBDownloadSpeed(ctx, res.ipAddr, res.port, enableTLS, speedURL)
@@ -1154,7 +1154,7 @@ func runNSBSpeedBatch(ctx context.Context, session *appSession, rows []nsbScanMe
 		reportNSBProgress(session, "speed", qualified, speedLimit, "测速中")
 	}, func(idx int, speedErr string) {
 		res := &results[idx]
-		session.sendWSMessage("nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
+		session.sendTaskResult(ctx, "nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
 	}, func(idx int) (float64, string) {
 		res := &results[idx]
 		return runNSBDownloadSpeed(ctx, res.ipAddr, res.port, enableTLS, speedURL)

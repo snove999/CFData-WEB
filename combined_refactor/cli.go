@@ -998,9 +998,14 @@ func applyConfigDebug(value any) {
 
 func newCLISession(cfg *cliConfig) *appSession {
 	session := &appSession{progressState: map[string][2]int{}}
+	// emit 只在这里赋值一次，且在会话返回前完成；赋值与
+	// sendWSMessageToConn 里的 emit 读取使用同一把 wsMutex，
+	// 使读写同步关系完整。WS 会话从不赋值 emit，恒为 nil。
+	session.wsMutex.Lock()
 	session.emit = func(msgType string, data interface{}) {
 		handleCLIMessage(cfg, session, msgType, data)
 	}
+	session.wsMutex.Unlock()
 	return session
 }
 

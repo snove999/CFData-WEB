@@ -7,10 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -138,7 +140,86 @@ func hasNoColorArg() bool {
 	return false
 }
 
+// 后端就绪状态（第二阶段）：只反映本地 HTTP 服务状态，不依赖任何外网探测。
+// starting：Main() 已开始但监听器尚未绑定；
+// ready：监听器已绑定且 Serve 循环已开始，本地初始化（配置加载等）均已完成；
+// failed：监听失败、Serve 异常退出或 Main() 已退出。
+var (
+	backendHealthMu     sync.Mutex
+	backendHealthStatus = "starting"
+	backendHealthError  = ""
+)
+
+func setBackendHealthStatus(status, errMsg string) {
+	backendHealthMu.Lock()
+	defer backendHealthMu.Unlock()
+	backendHealthStatus = status
+	backendHealthError = errMsg
+}
+
+func backendHealthStatusValue() string {
+	backendHealthMu.Lock()
+	defer backendHealthMu.Unlock()
+	return backendHealthStatus
+}
+
+// noteBackendExited 在后端退出时把健康状态置为 failed：
+// 状态为 starting 或 ready 时都转换；状态已为 failed 时保留已有的具体失败原因，
+// 不被通用的退出原因覆盖。
+func noteBackendExited(msg string) {
+	backendHealthMu.Lock()
+	defer backendHealthMu.Unlock()
+	if backendHealthStatus == "starting" || backendHealthStatus == "ready" {
+		backendHealthStatus = "failed"
+		backendHealthError = msg
+	}
+}
+
+// isLoopbackRemoteAddr 判断请求是否来自本机回环地址（127.0.0.0/8、::1）。
+// RemoteAddr 形如 "IP:port"，解析失败时按非回环处理。
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// handleHealthz 只读本地状态，不做任何外网探测、不读配置、不访问业务 handler，
+// 因此它自身不会成为启动死锁的原因；也不走 requireAuth。
+// 访问控制：仅允许回环客户端，非回环请求一律 403，不泄露健康状态。
+// 监听地址本身不改（桌面端仍监听全部接口，页面访问行为不变），只收紧本接口。
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	if !isLoopbackRemoteAddr(r.RemoteAddr) {
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "forbidden", "error": "仅允许本机访问"})
+		return
+	}
+	backendHealthMu.Lock()
+	status, errMsg := backendHealthStatus, backendHealthError
+	backendHealthMu.Unlock()
+	if status == "ready" {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	payload := map[string]interface{}{"status": status}
+	if errMsg != "" {
+		payload["error"] = errMsg
+	}
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
 func main() {
+	setBackendHealthStatus("starting", "")
+	// R3 §2.3（第二轮补齐任务 4）：每次实际后端启动的唯一汇合点——
+	// 桌面端与 iOS 端都经过 main() 顶部（iOS 的 Start() 拉起的 Main()
+	// 即本函数经构建改名），因此只在此处重置一次；不在 Start() 里
+	// 再调一次，否则一次启动会递增两次代次（见交付报告）。
+	resetBackendGeneration()
 	rewriteBoolFlagArgs()
 	if !enableTerminalANSI() || os.Getenv("NO_COLOR") != "" || hasNoColorArg() {
 		disableANSIColors()
@@ -268,6 +349,7 @@ func main() {
 		_, _ = w.Write(data)
 	}))
 	http.HandleFunc("/ws", requireAuth(handleWebSocket))
+	http.HandleFunc("/healthz", handleHealthz)
 
 	addr := fmt.Sprintf(":%d", listenPort)
 	displayHost := "localhost"
@@ -306,7 +388,44 @@ func main() {
 		Addr:              addr,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	if err := server.ListenAndServe(); err != nil {
+	// 第二阶段：先 Listen 再 Serve。监听成功即表示 HTTP 服务已开始接收请求，
+	// 此时本地初始化（配置加载、代理应用等）均已完成；外网探测
+	// （locations、版本检查）均在后台协程，不阻塞就绪。Serve 仍使用
+	// 同一个 server（ReadHeaderTimeout 不变），与 ListenAndServe 等价。
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		setBackendHealthStatus("failed", err.Error())
+		fmt.Printf("启动失败: %v\n", err)
+		return
+	}
+	// R3 §16.3 testMainListenerHook：Listen 成功后立即调用（生产恒 nil）。
+	if h := testHookGet(&testMainListenerHook); h != nil {
+		h(listener)
+	}
+	// R3 §2.10（第二轮补齐任务 5）：启动本代次的 stateSweeper（每代次一个，
+	// 由当次 Main() 拥有）；Serve 返回后停止 defer 等待其退出确认。
+	// Listen 失败时 sweeper 从不启动。重复启动由 startStateSweeper 的
+	// CAS 拒绝（sweeperLive 恒 ∈ {0,1}）。
+	sweeperStop, sweeperDone, sweeperStarted := startStateSweeper()
+	if sweeperStarted {
+		defer func() {
+			close(sweeperStop)
+			<-sweeperDone
+		}()
+	}
+	// S7 Batch 2（方案 A，§11.5.4）：与 stateSweeper 并列启动看门狗。
+	// started=false 只表示已有看门狗在运行（防御性分支；生产 main() 只跑一次，
+	// 实际不可达；iOS 重启时前次 Main() 的 defer 已停旧看门狗，live 已回 0）——
+	// 此时不注册停止 defer（不拥有该实例的 stop 通道），继续 Serve。
+	// stopWatchdog 幂等：重复停止安全；defer 在 sweeper 的 defer 之后注册，
+	// 返回时先执行（LIFO），两者独立、无共享锁，停止顺序无关。
+	wdStop, wdDone, wdStarted := startWatchdog()
+	if wdStarted {
+		defer stopWatchdog(wdStop, wdDone)
+	}
+	setBackendHealthStatus("ready", "")
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		setBackendHealthStatus("failed", err.Error())
 		fmt.Printf("启动失败: %v\n", err)
 	}
 }

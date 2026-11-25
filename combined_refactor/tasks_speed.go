@@ -143,7 +143,7 @@ func runSpeedTest(ctx context.Context, session *appSession, ip string, port int,
 		if ctx.Err() != nil {
 			return
 		}
-		session.sendWSMessage("speed_test_result", map[string]string{"ip": ip, "speed": speedErr})
+		session.sendTaskResult(ctx, "speed_test_result", map[string]interface{}{"ip": ip, "speed": speedErr})
 		session.sendWSMessage("log", "测速失败: "+speedErr)
 		return
 	}
@@ -152,7 +152,7 @@ func runSpeedTest(ctx context.Context, session *appSession, ip string, port int,
 	}
 	speedStr := fmt.Sprintf("%.2fMB/s", speedMB)
 
-	session.sendWSMessage("speed_test_result", map[string]string{"ip": ip, "speed": speedStr})
+	session.sendTaskResult(ctx, "speed_test_result", map[string]interface{}{"ip": ip, "speed": speedStr})
 	session.sendWSMessage("log", fmt.Sprintf("IP %s 测速完成: %s", ip, speedStr))
 }
 
@@ -268,7 +268,7 @@ func runOfficialSpeedBatch(ctx context.Context, session *appSession, port int, c
 	session.sendWSMessage("official_speed_progress", map[string]interface{}{"current": 0, "total": len(results), "qualified": 0, "limit": speedLimit})
 	rateLimited := false
 	updated, qualified := runOfficialSpeedTestsCore(ctx, results, port, speedLimit, speedMin, customURL, func(current, total, qualified int, result TestResult) {
-		session.sendWSMessage("speed_test_result", map[string]string{"ip": result.IP, "speed": result.Speed})
+		session.sendTaskResult(ctx, "speed_test_result", map[string]interface{}{"ip": result.IP, "speed": result.Speed})
 		session.sendWSMessage("official_speed_progress", map[string]interface{}{"current": current, "total": total, "qualified": qualified, "limit": speedLimit})
 	}, func() {
 		rateLimited = true

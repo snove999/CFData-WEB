@@ -393,7 +393,7 @@ func runOfficialTask(ctx context.Context, session *appSession, ipType int, scanM
 		session.scanResults = append(session.scanResults, *res)
 		session.scanMutex.Unlock()
 
-		session.sendWSMessage("scan_result", *res)
+		session.sendTaskResult(ctx, "scan_result", *res)
 	})
 
 	if wasCanceled || ctx.Err() != nil {
@@ -524,7 +524,7 @@ func runDetailedTest(ctx context.Context, session *appSession, selectedDC string
 			res.Region = scan.Region
 			res.City = scan.City
 		}
-		session.sendWSMessage("test_result", *res)
+		session.sendTaskResult(ctx, "test_result", *res)
 
 		resMutex.Lock()
 		results = append(results, *res)
