@@ -1771,7 +1771,7 @@
                         <input id="officialSpeedUrl" type="text" value="自动选择"
                             placeholder="例如 speed.okl.abrdns.com" oninput="markSpeedUrlCustom('officialSpeedUrlPreset')">
                         <button class="mini-action-btn" title="恢复自动选择测速网站"
-                            onclick="resetDefaultSpeedUrl('officialSpeedUrl', 'officialSpeedUrlPreset')">↺</button>
+                            onclick="markSpeedUrlUserEdited('officialSpeedUrl'); resetDefaultSpeedUrl('officialSpeedUrl', 'officialSpeedUrlPreset')">↺</button>
                     </div>
                 </div>
                 <div class="option-item full-width">
@@ -1885,7 +1885,7 @@
                         <input id="nsbSpeedUrl" type="text" value="自动选择"
                             placeholder="speed.okl.abrdns.com" oninput="markSpeedUrlCustom('nsbSpeedUrlPreset')">
                         <button class="mini-action-btn" title="恢复自动选择测速网站"
-                            onclick="resetDefaultSpeedUrl('nsbSpeedUrl', 'nsbSpeedUrlPreset')">↺</button>
+                            onclick="markSpeedUrlUserEdited('nsbSpeedUrl'); resetDefaultSpeedUrl('nsbSpeedUrl', 'nsbSpeedUrlPreset')">↺</button>
                     </div>
                 </div>
                 <div class="option-item full-width">
@@ -2437,6 +2437,11 @@
         let nsbSpeedEnabledForResults = false;
         const AUTO_SPEED_URL_VALUE = 'auto';
         const AUTO_SPEED_URL_LABEL = '自动选择';
+        // 用户手动编辑保护：用户实际操作过某一组测速源后，该组不再被
+        // init_config、自动加载或 config_data 覆盖；持续到页面生命周期结束，
+        // 改回原值也不会解除；官方与非标分别记录，互不影响。
+        let officialSpeedUrlUserEdited = false;
+        let nsbSpeedUrlUserEdited = false;
         let officialTestQualifiedFilter = 'all';
         let officialTestLatencyFilter = 0;
         let officialTestLossFilter = 100;
@@ -2469,6 +2474,11 @@
         let proxyWarningCountdownTimer = null;
         let proxyCountryCheckPending = false;
         let proxyCountryCheckTimer = null;
+        // 第三阶段修正：用户主动地区检查的代次。开始、完成、超时都会递增；
+        // 初始化异步结果只在代次与当前连接 init_config 到达时一致且无检查进行中时才应用，
+        // 旧的初始化结果不得覆盖用户主动检查的状态。
+        let proxyCountryCheckSeq = 0;
+        let proxyCountryInitSeq = -1;
         let proxyWarningSinglePass = false;
         let resultModalMode = 'scan';
         let copyModalMode = 'scan';
@@ -2664,7 +2674,13 @@
             }
         }
 
+        function markSpeedUrlUserEdited(id) {
+            if (id === 'officialSpeedUrl' || id === 'officialSpeedUrlPreset') officialSpeedUrlUserEdited = true;
+            else if (id === 'nsbSpeedUrl' || id === 'nsbSpeedUrlPreset') nsbSpeedUrlUserEdited = true;
+        }
+
         function applySpeedUrlPreset(targetId, value) {
+            markSpeedUrlUserEdited(targetId);
             const input = document.getElementById(targetId);
             if (!input) return;
             input.readOnly = false;
@@ -2693,6 +2709,7 @@
         }
 
         function markSpeedUrlCustom(presetId) {
+            markSpeedUrlUserEdited(presetId);
             const preset = document.getElementById(presetId);
             if (preset) preset.value = 'custom';
         }
@@ -2879,8 +2896,8 @@
                 if (n.relinkHost !== undefined) setValue('nsbRelinkHost', n.relinkHost);
                 syncRelinkControls();
             }
-            if (o.speedUrl) applySpeedUrlConfig('officialSpeedUrl', 'officialSpeedUrlPreset', o.speedUrl);
-            if (n.speedUrl) applySpeedUrlConfig('nsbSpeedUrl', 'nsbSpeedUrlPreset', n.speedUrl);
+            if (o.speedUrl && !officialSpeedUrlUserEdited) applySpeedUrlConfig('officialSpeedUrl', 'officialSpeedUrlPreset', o.speedUrl);
+            if (n.speedUrl && !nsbSpeedUrlUserEdited) applySpeedUrlConfig('nsbSpeedUrl', 'nsbSpeedUrlPreset', n.speedUrl);
             syncOfficialSpeedConfigState();
             syncNSBSpeedConfigState();
             updateOfficialAutoSpeedControls();
@@ -2990,13 +3007,19 @@
         }
 
         function autoLoadConfig() {
+            // 第三阶段性能日志：记录最小 init_config 触发的配置加载开始与完成时间。
+            perfLog('auto_load_config_start', '');
             let pref;
             try {
                 pref = localStorage.getItem('cfdata-autoload');
             } catch (e) {
+                perfLog('auto_load_config_done', 'skipped');
                 return;
             }
-            if (!pref || pref === 'off') return;
+            if (!pref || pref === 'off') {
+                perfLog('auto_load_config_done', 'skipped');
+                return;
+            }
             try {
                 if (pref === 'localStorage') {
                     const raw = localStorage.getItem('cfdata-config');
@@ -3009,13 +3032,14 @@
             } catch (e) {
                 console.error('[cfdata] autoLoadConfig failed:', e);
             }
+            perfLog('auto_load_config_done', 'pref=' + pref);
         }
 
         function loadConfigFromServer() {
             wsSend({ type: 'get_config' });
         }
 
-        function wsSend(payload) {
+        function wsSendRaw(payload) {
             if (!ws || ws.readyState !== WebSocket.OPEN) {
                 recordWebDebugError('ws_send', 'WebSocket 未连接');
                 return false;
@@ -3028,6 +3052,349 @@
                 console.error('ws.send failed:', e);
                 return false;
             }
+        }
+
+        // 第四阶段 B 批次 R3：注册门（见设计 v22.2 §1.8）。
+        // 返回 true（已发出）/ 'queued'（已入队，注册后放行）/ false（发送失败）。
+        // 'queued' 为真值：调用方按现有代码继续执行（记录意图、更新 UI），
+        // 入队消息在 ack 时按 §1.9 代次规则 purge 后 FIFO 放行。
+        // register_page 不入队（它本身就是注册）；其余业务消息在未注册时入队。
+        function wsSend(payload) {
+            if (payload && payload.type === 'register_page') return wsSendRaw(payload);
+            if (!pageRegistered) {
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
+                    recordWebDebugError('ws_send', 'WebSocket 未连接');
+                    return false;
+                }
+                if (pendingBusinessQueue.length >= BUSINESS_QUEUE_CAP) {
+                    recordWebDebugError('ws_send', '业务队列已满（64）');
+                    return false;
+                }
+                pendingBusinessQueue.push({ payload: payload, queuedEpoch: initConfigEpoch || '', queuedConnSeq: perfConnSeq });
+                return 'queued';
+            }
+            return wsSendRaw(payload);
+        }
+
+        // 第四阶段 B 批次 R3：注册与恢复查询辅助函数（见设计 v22.2 §1、§10）。
+        // register_page 是每连接的第一条消息：仅当 socket 已 OPEN 且本连接已收到
+        // init_config 时发送；registerPageSent 保证每连接只发一次。发送失败时不置位，
+        // 由 init_config 的再次调用重试（onopen 与 init_config 两处调用，
+        // 任一先到都能触发注册）。
+        function tryRegisterPage() {
+            if (registerPageSent) return;
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            if (!initConfigReceived) return;
+            if (wsSend({ type: 'register_page', data: { pageId: pageId } })) registerPageSent = true;
+        }
+
+        // 第四阶段 B 批次 R3：队列消息的跨代次可重放判定（见设计 v22.2 §1.9 分类表）。
+        // 只有只读查询可跨代次重放（读操作无副作用，任何代次执行结果相同）；
+        // 其余全部类型——一次性控制消息、run_in_background 命令、跟随请求，
+        // 以及未分类的新类型（fail-closed，默认按一次性控制处理）——在 epoch
+        // 变化时一律丢弃，不重放。
+        // S7 C3 P4 (n8)①：replay_results 已移出本列表——旧 epoch 的 replay 在新 epoch
+        // 后端上只会得到 epoch-mismatch 拒绝，不是“相同结果”。
+        function isReplayableAcrossGenerations(type) {
+            return type === 'get_background_task_status' || type === 'get_speed_url_status' ||
+                type === 'get_management_proxy' || type === 'get_config';
+        }
+
+        function dropQueuedEntry(entry) {
+            // 跟随请求被 purge 时清除其待处理状态（该请求永远不会发出，
+            // 不再等一个不会到来的 following 回复）。
+            const type = entry.payload && entry.payload.type;
+            if (type === 'follow_background_task') {
+                followRequestPending = false;
+                followRequestTaskId = '';
+            }
+        }
+
+        // S7 C3 P4 (n3)：记录终结时主动删除其对应的队列项（按 requestId 匹配 replay_results 项）。
+        function dropQueuedReplayItem(requestId) {
+            if (!requestId || pendingBusinessQueue.length === 0) return;
+            for (let i = pendingBusinessQueue.length - 1; i >= 0; i--) {
+                const p = pendingBusinessQueue[i].payload;
+                const d = (p && p.data && typeof p.data === 'object') ? p.data : {};
+                if (p && p.type === 'replay_results' && d.requestId === requestId) pendingBusinessQueue.splice(i, 1);
+            }
+        }
+
+        // S7 C3 P4 (n8)②：非 flush 的队列项移除必须终结对应账本记录（→ expired，诊断 queue-dropped）。
+        // 只终结 state === 'queued' 的记录；在途/终态记录不受队列移除影响。
+        function terminateQueuedReplayRecord(entry, reason) {
+            const p = entry && entry.payload;
+            if (!p || p.type !== 'replay_results') return;
+            const d = (p.data && typeof p.data === 'object') ? p.data : {};
+            const reqId = (typeof d.requestId === 'string') ? d.requestId : '';
+            if (!reqId) return;
+            const rec = replayLedger.get(reqId);
+            if (rec && rec.state === 'queued') {
+                ledgerSetState(reqId, 'expired');
+                perfLog('ws_queue_dropped_ledger', 'requestId=' + reqId + ' reason=' + reason);
+            }
+        }
+
+        // ack 时的代次 purge（见设计 v22.2 §1.9、§10.5 步骤 2）：
+        // 仅保留两类——与 ack 同代次的全部消息，以及跨代次可重放的只读查询；
+        // 其余跨代次消息一律丢弃（一次性控制消息与 run_in_background 命令，
+        // 后者按 §1.9 表格跨代次不重放、仅保留 pendingPublishIntents 的意图记录）。
+        // 注意 §1.9 的 purge 句只写了“一次性控制”，但 §10.5 步骤 2 明确要求同时
+        // 丢弃跨代次的 run_in_background 命令；按保留集合实现即同时满足两者。
+        // epoch 未知的条目（ack 时不应再存在，见 1.9）按一次性控制丢弃并记日志。
+        function purgeBusinessQueueForAck(ackEpoch) {
+            if (pendingBusinessQueue.length === 0) return;
+            const kept = [];
+            const dropped = [];
+            for (const entry of pendingBusinessQueue) {
+                const type = entry.payload && entry.payload.type;
+                if (!entry.queuedEpoch) {
+                    perfLog('ws_business_queue_dropped', 'type=' + type + ' reason=epoch-unknown queuedEpoch= queuedConnSeq=' + entry.queuedConnSeq);
+                    dropQueuedEntry(entry);
+                    dropped.push(entry);
+                    continue;
+                }
+                if (entry.queuedEpoch !== ackEpoch && !isReplayableAcrossGenerations(type)) {
+                    perfLog('ws_business_queue_dropped', 'type=' + type + ' reason=epoch-changed queuedEpoch=' + entry.queuedEpoch + ' queuedConnSeq=' + entry.queuedConnSeq + ' ackEpoch=' + ackEpoch);
+                    dropQueuedEntry(entry);
+                    dropped.push(entry);
+                    continue;
+                }
+                kept.push(entry);
+            }
+            pendingBusinessQueue = kept;
+            // S7 C3 P4 (n8)②：移除的队列项终结对应账本记录（在循环结束后执行，避免遍历中改队列）。
+            for (let i = 0; i < dropped.length; i++) terminateQueuedReplayRecord(dropped[i], 'queue-dropped');
+        }
+
+        // onclose 时的 epoch-unknown purge（见设计 v22.2 §1.9）：
+        // 本连接从未收到 init_config 时，队列中本连接入队且 epoch 未知的条目
+        // 代次归属无法确定，全部丢弃；更早连接的、已带 epoch 的条目保留，
+        // 留待下一次 ack 时按代次规则处理。
+        function purgeEpochUnknownQueue(gen) {
+            if (initConfigReceived) return;
+            if (pendingBusinessQueue.length === 0) return;
+            const kept = [];
+            const dropped = [];
+            for (const entry of pendingBusinessQueue) {
+                if (entry.queuedEpoch === '' && entry.queuedConnSeq === gen) {
+                    perfLog('ws_business_queue_dropped', 'type=' + (entry.payload && entry.payload.type) + ' reason=epoch-unknown queuedEpoch= queuedConnSeq=' + entry.queuedConnSeq);
+                    dropQueuedEntry(entry);
+                    dropped.push(entry);
+                    continue;
+                }
+                kept.push(entry);
+            }
+            pendingBusinessQueue = kept;
+            // S7 C3 P4 (n8)②：移除的队列项终结对应账本记录（在循环结束后执行，避免遍历中改队列）。
+            for (let i = 0; i < dropped.length; i++) terminateQueuedReplayRecord(dropped[i], 'queue-dropped');
+        }
+
+        // init_config 到达时回填（见设计 v22.2 §1.9）：本连接在 init_config 前
+        // 入队的消息（queuedEpoch == ''）回填为本连接的 epoch，供 ack 时的
+        // 代次 purge 使用；旧连接遗留的条目已有非空 epoch，不触碰。
+        function backfillBusinessQueueEpoch() {
+            for (const entry of pendingBusinessQueue) {
+                if (entry.queuedEpoch === '' && entry.queuedConnSeq === perfConnSeq) {
+                    entry.queuedEpoch = initConfigEpoch;
+                }
+            }
+        }
+
+        // ack 后按 FIFO 发出队列剩余消息（已按 §1.9 代次规则 purge）。
+        // 发送中途 socket 若失效，剩余消息重新入队（保留原 queuedEpoch 与
+        // queuedConnSeq），由下一次 ack 再次 purge/放行；run_in_background
+        // 的意图记录在 pendingPublishIntents 中，不受队列清空影响，由恢复查询决议终态。
+        // S7 C3 P4 (n8)：每一项 replay_results 在真正发出之前依次通过四门检查
+        // （门 1 流身份 → 门 2 F-2 → 门 3 高水位 → 门 4 发送尝试），任一门失败即丢弃该项
+        // （不发送、不重入队）；门 1/门 3 失败继续下一条，门 2 失败停止本次 flush；
+        // 门 1–3 的代码与 wsSend 调用处于同一同步循环体内，不得拆分为两遍结构。
+        function flushBusinessQueue() {
+            if (pendingBusinessQueue.length === 0) return;
+            const queue = pendingBusinessQueue;
+            pendingBusinessQueue = [];
+            for (let i = 0; i < queue.length; i++) {
+                const entry = queue[i];
+                const payload = entry.payload;
+                if (payload && payload.type === 'replay_results') {
+                    const d = (payload.data && typeof payload.data === 'object') ? payload.data : {};
+                    const reqId = (typeof d.requestId === 'string') ? d.requestId : '';
+                    const rec = reqId ? replayLedger.get(reqId) : undefined;
+                    // 门 1 流身份（只读载荷，先于账本查找；fail-closed）。
+                    const flowTaskId = currentBackgroundTaskId || replayTaskId;
+                    const taskOk = typeof d.taskId === 'string' && d.taskId !== '' && d.taskId === flowTaskId;
+                    const epochOk = typeof d.backendEpoch === 'string' && d.backendEpoch !== '' && d.backendEpoch === initConfigEpoch;
+                    if (!taskOk || !epochOk) {
+                        if (rec && rec.state === 'queued') ledgerSetState(reqId, 'expired');
+                        perfLog('ws_flush_gate1_drop', 'requestId=' + reqId + ' reason=' + (!taskOk ? 'task-stale' : 'epoch-stale'));
+                        continue;
+                    }
+                    // 门 2 F-2（失败 → 丢弃本项，停止本次 flush；剩余项原对象重入队）。
+                    if (isF2Reached()) {
+                        if (rec && rec.state === 'queued') ledgerSetState(reqId, 'expired');
+                        perfLog('ws_flush_gate2_drop', 'requestId=' + reqId + ' reason=f2-closed');
+                        for (let j = i + 1; j < queue.length; j++) pendingBusinessQueue.push(queue[j]);
+                        break;
+                    }
+                    // 门 3 高水位（记录缺失 → fail-closed 丢弃；非 queued → 丢弃；seqNo ≤ 高水位 → 丢弃）。
+                    if (!rec) {
+                        perfLog('ws_flush_gate3_drop', 'requestId=' + reqId + ' reason=unknown_request');
+                        continue;
+                    }
+                    if (rec.state !== 'queued') {
+                        perfLog('ws_flush_gate3_drop', 'requestId=' + reqId + ' reason=not-queued state=' + rec.state);
+                        continue;
+                    }
+                    if (rec.seqNo <= replaySentHighWaterSeq) {
+                        ledgerSetState(reqId, 'expired');
+                        perfLog('ws_flush_gate3_drop', 'requestId=' + reqId + ' reason=queue-stale seqNo=' + rec.seqNo + ' highWater=' + replaySentHighWaterSeq);
+                        continue;
+                    }
+                    // 门 4 可发送性：B-R5 先行（在途已满 4 时取代最旧者），再真正发出。
+                    if (replayInflightCount(d.taskId, d.backendEpoch) >= 4) replaceOldestInflight(d.taskId, d.backendEpoch);
+                    const sendResult = wsSend(payload);
+                    if (sendResult === false) {
+                        for (let j = i; j < queue.length; j++) pendingBusinessQueue.push(queue[j]);
+                        break;
+                    }
+                    if (sendResult === 'queued') {
+                        // wsSend 已将其重新入队（未注册时）；本项记录保持 queued，剩余项原对象重入队。
+                        for (let j = i + 1; j < queue.length; j++) pendingBusinessQueue.push(queue[j]);
+                        break;
+                    }
+                    // 事件 17：flush 真正发出——M-R6 三步（记录 → inflight、身份赋值、启动等待计时器）+ 高水位推进。
+                    applyReplaySendConfirmed(reqId, rec.seqNo, rec.trigger || 'initial', d.taskId, d.backendEpoch);
+                    replayTaskId = d.taskId;
+                    replayThroughSeq = 0;
+                    replayCompleteReceived = false;
+                    replayState = 'requesting';
+                    perfLog('ws_replay_flushed', 'task=' + d.taskId + ' requestId=' + reqId + ' seqNo=' + rec.seqNo + ' trigger=' + (rec.trigger || 'initial'));
+                    continue;
+                }
+                const result = wsSend(payload);
+                if (result === false) {
+                    for (let j = i; j < queue.length; j++) pendingBusinessQueue.push(queue[j]);
+                    break;
+                }
+            }
+        }
+
+        // ack 后消费暂存的 connect-time 信号（见设计 v22.2 §10.5）：
+        // 暂存时记录的 epoch 与当前 initConfigEpoch 不一致时丢弃（旧代次信号）；
+        // 一致时按正常 found/missing 流程处理（经版本守卫与 R1/R2 targetsOld 守卫）。
+        function consumeConnectTimeSignal() {
+            const stashed = pendingConnectTimeSignal;
+            pendingConnectTimeSignal = null;
+            if (!stashed) return;
+            const epoch = stashed.epoch || '';
+            if (epoch && initConfigEpoch && epoch !== initConfigEpoch) {
+                perfLog('ws_stash_epoch_dropped', 'type=' + stashed.type + ' epoch=' + epoch + ' current=' + initConfigEpoch);
+                return;
+            }
+            handleMessage({ type: stashed.type, data: stashed.data || {} });
+        }
+
+        // 版本守卫的核心判定（见设计 v22.2 §6.4、§10.4），无副作用。
+        // 返回 'ok'（可应用）/ 'duplicate'（同版本同任务，已应用一次）/
+        // 'stale-version'（版本落后）/ 'stale-epoch'（代次不符）。
+        // 信号未带 epoch/version（旧后端扁平快照）时跳过对应校验，按旧行为处理。
+        function checkVersionedSignal(epoch, version, snapshot) {
+            if (epoch && initConfigEpoch && epoch !== initConfigEpoch) return 'stale-epoch';
+            if (typeof version === 'number') {
+                if (version === 0 && appliedVersion > 0) return 'stale-version';
+                if (version < appliedVersion) return 'stale-version';
+                if (version === appliedVersion && snapshot && snapshot.taskId && snapshot.taskId === currentBackgroundTaskId) return 'duplicate';
+            }
+            return 'ok';
+        }
+
+        // 携带快照的信号（found、enabled、following、update）的唯一版本守卫入口
+        // （见设计 v22.2 §10.4）：通过 R1/R2 的 taskId 检查之后调用本函数。
+        // 守卫失败时不应用快照、不推进 appliedVersion；调用方据返回值决定
+        // 是否做身份记录等后续处理。返回与 checkVersionedSignal 相同的判定。
+        function applyVersionedSnapshot(epoch, version, snapshot) {
+            const verdict = checkVersionedSignal(epoch, version, snapshot);
+            if (verdict !== 'ok') return verdict;
+            if (typeof version === 'number' && version > appliedVersion) appliedVersion = version;
+            applyBackgroundSnapshot(snapshot);
+            return 'ok';
+        }
+
+        // 恢复查询/pending/found/missing/enabled 携带的逐意图决议
+        // （见设计 v22.2 §10.6）：终态结局（published/failed/superseded/
+        // publish-lost/intent-unknown）清除意图，pending 保留意图。
+        // 意图的清除与快照的应用是独立的：清除按 publishId，不受版本守卫影响；
+        // 快照是否应用由 applyVersionedSnapshot 决定。
+        function processPublishOutcomes(outcomes) {
+            if (!Array.isArray(outcomes)) return;
+            const terminalOutcomes = ['published', 'failed', 'superseded', 'publish-lost', 'intent-unknown'];
+            for (const o of outcomes) {
+                if (!o || !o.publishId) continue;
+                if (o.outcome === 'pending') continue;
+                if (terminalOutcomes.indexOf(o.outcome) < 0) {
+                    perfLog('ws_intent_outcome_unknown', 'publishId=' + o.publishId + ' outcome=' + o.outcome);
+                    continue;
+                }
+                if (pendingPublishIntents[o.publishId]) {
+                    delete pendingPublishIntents[o.publishId];
+                    perfLog('ws_intent_resolved', 'publishId=' + o.publishId + ' outcome=' + o.outcome);
+                }
+            }
+        }
+
+        function clearPendingRecovery() {
+            pendingRecovery = null;
+            recoveryRejectedRetries = 0;
+            clearRecoveryRequeryTimer();
+        }
+
+        function clearRecoveryRequeryTimer() {
+            if (recoveryRequeryTimer) { clearTimeout(recoveryRequeryTimer); recoveryRequeryTimer = null; }
+        }
+
+        // 取消上一轮未决的恢复查询（见设计 v22.2 §10.1）：仅在发出新一轮
+        // recovery_query 前调用（旧 recoveryId 作废）；服务端删除待决记录。
+        function sendRecoveryCancel(recoveryId) {
+            if (!recoveryId) return;
+            wsSend({ type: 'recovery_cancel', data: { recoveryId: recoveryId } });
+        }
+
+        // ack 后：若有未确认的发布意图，向服务端查询终态（见设计 v22.2 §10.5）。
+        // 每连接的首轮查询 attempt 为 0；recoveryId 形如 rec-<pageId>-<perfConnSeq>-0。
+        function sendRecoveryQuery() {
+            const ids = Object.keys(pendingPublishIntents);
+            if (ids.length === 0) return false;
+            if (!pageRegistered) return false;
+            if (pendingRecovery) sendRecoveryCancel(pendingRecovery.recoveryId);
+            const recoveryId = 'rec-' + pageId + '-' + perfConnSeq + '-0';
+            const payload = { type: 'recovery_query', data: { pageId: pageId, unackedPublishIds: ids, recoveryId: recoveryId, attempt: 0 } };
+            if (wsSend(payload) !== true) return false;
+            pendingRecovery = { recoveryId: recoveryId, attempt: 0, serverDeadline: null };
+            recoveryRejectedRetries = 0;
+            perfLog('ws_recovery_query', 'recoveryId=' + recoveryId + ' intents=' + ids.length);
+            return true;
+        }
+
+        // serverDeadline 到达后的重查（见设计 v22.2 §10.5 步骤 5）：
+        // 同一 recoveryId、attempt +1；服务端无待决记录/无缓存时重新决议。
+        function sendRecoveryRequery() {
+            if (!pendingRecovery) return;
+            if (!ws || ws.readyState !== WebSocket.OPEN || !pageRegistered) return;
+            pendingRecovery.attempt += 1;
+            if (wsSend({ type: 'recovery_requery', data: { recoveryId: pendingRecovery.recoveryId, attempt: pendingRecovery.attempt } }) !== true) {
+                pendingRecovery.attempt -= 1;
+            }
+        }
+
+        // 按 pending 的 serverDeadline 安排一次重查；无 deadline 时不安排。
+        function scheduleRecoveryRequery() {
+            clearRecoveryRequeryTimer();
+            if (!pendingRecovery || !pendingRecovery.serverDeadline) return;
+            const delay = Math.max(0, pendingRecovery.serverDeadline - Date.now());
+            recoveryRequeryTimer = setTimeout(() => {
+                recoveryRequeryTimer = null;
+                sendRecoveryRequery();
+            }, delay);
         }
 
         function recordWebDebugError(source, detail) {
@@ -3106,15 +3473,1418 @@
             compactHitBuffer = [];
         }
 
+        let reconnectTimer = null;
+        let reconnecting = false;
+        let hasConnectedBefore = false;
+        // 第四阶段 A 批次：指数退避与连接代次。
+        // reconnectAttempt 为当前断线轮次的重连次数（成功连接后清零）；
+        // 退避序列 500 / 1000 / 2000 / 3000ms，上限 3000ms。
+        let reconnectAttempt = 0;
+        const RECONNECT_BASE_DELAY_MS = 500;
+        const RECONNECT_MAX_DELAY_MS = 3000;
+        // 第四阶段 A 批次：应用层心跳。服务端协议层 Ping 由浏览器自动回 Pong，
+        // JS 无法监听，故用应用层 heartbeat / heartbeat_ack 判断连接是否存活。
+        // 心跳只在页面可见时运行；后台停止，避免定时器节流误判。
+        let heartbeatTimer = null;
+        let heartbeatAckTimer = null;
+        let lastHeartbeatAckAt = 0;
+        const HEARTBEAT_INTERVAL_MS = 15000;
+        const HEARTBEAT_ACK_TIMEOUT_MS = 10000;
+        // 第四阶段 B 批次：重连恢复等待。重连成功后不再立即清空数据，
+        // 等后端发来 background_task_found / background_task_missing 再决定。
+        // 找到任务则保留旧数据（任务状态由快照恢复）；确认无任务则清空旧会话数据。
+        let recoveryPending = false;
+        let recoveryGen = 0;
+        let recoveryTimer = null;
+        // 第四阶段 B 批次修正（问题 1/3）：恢复等待开始时记录的旧任务身份与旧数据代次。
+        // 超时/missing 只能处理本次等待对应的旧任务；等待期间已有新任务或新数据时，
+        // 不得结束或清空新任务。数组长度不再作为判断依据。
+        let recoveryDataGen = 0;
+        let recoveryTaskId = '';
+        let currentBackgroundTaskId = '';
+        // S7 C3 P1：D-γ 任务身份（状态机 §2.5；实施计划 P1 §2）。8 空格缩进声明，供 harness 抽取。
+        // foregroundTaskIdentity：当前任务身份，单槽位；backgroundIdentities：被取代身份列表；
+        // backgroundRecoveryContexts：按 taskId 索引的恢复上下文；lastTerminalIdentity：前台终态收据单例。
+        // 单例统一结构 {taskId, backendEpoch, token}（状态机 §8/§2.5、实施计划 P1 §2 第三十三轮补充，用户裁决；
+        // token 为标记产生时有效的恢复令牌，无恢复进行时为 null。capacity-evidence §2.1 的 {taskId, backendEpoch,
+        // receivedAt} 为第三十三轮前的旧写法，已废止：receivedAt 不作单例字段；receiptAt 仍属身份记录，不得混入单例）。
+        let foregroundTaskIdentity = null;
+        let backgroundIdentities = [];
+        let backgroundRecoveryContexts = {};
+        let lastTerminalIdentity = null;
+        // S7 C3 P1/P5：前台恢复令牌单例（状态机 §2.1/§2.5）。同一任务恢复中断线存续，
+        // 代次变化时令牌不变；恢复达终态或 epoch 变化时失效；保存身份被替换时失效。
+        // 令牌为单调递增整数，null 表示无有效令牌。
+        let currentRecoveryToken = null;
+        let recoveryTokenCounter = 0;
+        // S7 C3 P5/F-2：绝对截止时间（断线墙钟 + 120000ms，文档建议值待裁决，永不重算）与 B 类定时器。
+        let f2DeadlineTimestamp = null;
+        let f2DeadlineTimer = null;
+        let uiCountdownTimer = null;
+        // S7 C3 P5/F-2 + P4 M-5（状态机 §2.2 暂缓与超时 / 设计 B §D；§2.3 missing/epoch 表）：
+        // 已终结流的迟到行隔离标记，同时是 F-2 转 missing 的显式标记。
+        // {taskId, backendEpoch, reason}；reason 'f2' = F-2 到期转 missing，'epoch' = epoch 变化旧流作废；
+        // null = 当前无已终结流。行本身无任务/epoch 字段，门控见 applyResultRow；
+        // 清除点唯一：新流 task_started 被采用时（D-γ）。F-2 到期后 isF2Reached() 因时间戳已清零而恒 false，
+        // 故到期后的发送门控以本标记为准（见 requestReplay）。
+        let expiredStreamRowGuard = null;
+        // S7 C3 P1 容量（状态机 §2.5 第十六轮定稿）：保留窗口 6 分钟；软上限 128 仅为告警阈值，不是硬上限。
+        const BACKGROUND_IDENTITY_RETENTION_MS = 360000;
+        const BACKGROUND_IDENTITY_SOFT_CAP = 128;
+        let backgroundSoftCapExceededActive = false;
+        let backgroundSoftCapExceededLoggedAt = 0;
+        // 第四阶段 B 批次修正（问题 2）：已发出跟随请求、正在等 following 回复，
+        // 以及该请求对应的任务 ID。跟随回复必须与请求目标一致才接受；
+        // 无请求时到达的 following 是迟到消息，须与当前任务身份一致才应用。
+        let followRequestPending = false;
+        let followRequestTaskId = '';
+        // 第四阶段 B 批次修正（问题 3）：页面数据变更代次。scanData/testData/dcList
+        // 每次业务性写入（新增行、替换、清空）时递增；仅排序/重排不递增。
+        let dataGen = 0;
+        const RECOVERY_WAIT_TIMEOUT_MS = 3000;
+
+        // 第四阶段 B 批次 R3：注册门与恢复查询（见设计 v22.2 §1、§10）。
+        // pageId 为本页会话唯一标识（页面加载时生成，生命周期内不变，重连不换）；
+        // pageRegistered 为真仅当本连接已收到 register_page_ack。
+        // 业务消息在注册前由 wsSend 暂存入 pendingBusinessQueue，ack 后按 §1.9
+        // 代次规则 purge 再 FIFO 放行；发布意图记入 pendingPublishIntents，
+        // 独立于命令队列，只由终态结局清除。
+        let pageId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('page-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
+        let pageRegistered = false;
+        let initConfigReceived = false;
+        let initConfigEpoch = '';
+        let registerPageSent = false;
+        let pendingConnectTimeSignal = null;
+        const BUSINESS_QUEUE_CAP = 64;
+        let pendingBusinessQueue = [];
+        let pendingPublishIntents = {};
+        let publishCounter = 0;
+        let appliedVersion = 0;
+        let prevBackendEpoch = '';
+        let pendingRecovery = null;
+        let recoveryRequeryTimer = null;
+        let recoveryRejectedRetries = 0;
+        let registerRejectedCount = 0;
+        let registerRejectedStop = false;
+
+        // S6 结果重放：序号状态与三态（见设计 v7 §5.4/§5.6/§5.8）。
+        // replayLastSeq：已按序消费的最大 seq（水位）；replayPending：乱序缓冲（Map，seq→{type,row}，上限 64 行）；
+        // replayState：本次重放状态（idle/requesting/replaying/done）；replayTaskId/replayThroughSeq：本次重放的任务与边界；
+        // replayCompleteReceived：本次重放的 replay_complete 是否已收到；replayGapTimer：缺口 2 秒重请求定时器；
+        // typeTerminal：各类型是否终态（不再产生新行）；typeReconciled：test/nsb 显示数组是否已被终态全量覆盖；
+        // resultReplaySupported：init_config 是否声明 resultReplay 能力（缺失 = 旧后端，不发 replay_results）。
+        let replayLastSeq = 0;
+        let replayPending = new Map();
+        let replayState = 'idle';
+        let replayTaskId = '';
+        let replayThroughSeq = 0;
+        let replayCompleteReceived = false;
+        let replayGapTimer = null;
+        let typeTerminal = { scan: false, test: false, nsb: false, speed: false };
+        let typeReconciled = { test: false, nsb: false };
+        let resultReplaySupported = false;
+
+        // S7 C3 P2/P3：认领状态（状态机 §2.2/§3.2–§3.3；实施计划 P2 §5/P3）。
+        // claimState：'idle'（无在途认领）/ 'claiming'（等待回执或重试中）/
+        //   'accepted'（刚接受，requestReplay 消费后回 'idle'，同一同步段内不被观测到）；
+        // claimPhase：'first'（首次 1 次 + 最多 3 次额外重试）/ 'second'（有界等待，计数重置、独立计数）/
+        //   'polling'（低频轮询，仍属 claiming 子状态，不新增顶层状态名）；
+        // claimSentCount：当前阶段已发送数（发送失败不计入；阶段切换时清零）；
+        // claimGen：最近一次成功发送时代次；claimLastReason：最近一次拒绝理由；
+        // claimPollLastSent：最近一次成功发送时刻（轮询限速：每 5 秒最多 1 次）。
+        let claimState = 'idle';
+        let claimPhase = 'first';
+        let claimSentCount = 0;
+        let claimGen = 0;
+        let claimLastReason = '';
+        let claimPollLastSent = 0;
+        let claimWaitTimer = null;
+        let claimRetryTimer = null;
+        let claimPollTimer = null;
+
+        // S7 C3 P4：重放请求身份与等待管理（状态机 §2.2；实施计划 P4）。
+        // currentReplayRequestId：当前正在等待响应的最新一次重放请求的 requestId（变量是权威，账本是记录；null 合法）；
+        // replayWaitTimer：按请求计时的等待计时器，复用为三角色（response / rejection-followup / tail-gap），同一时刻最多一个实例；
+        // replaySilentRetryCount：连续静默计数（超时触发时 +1；行到达/当前完成/终结性拒绝/进展驱动的实际发送时清零；断线保留；F-2 作废）；
+        // replayExhausted：replaying(exhausted) 子状态标志；replayTailGap：尾部缺口待决标志；
+        // replayLedger / replayTombstones / replayLedgerSeq：请求生命周期账本（活记录 ≤12、墓碑 ≤16，PROVISIONAL，待 L-3 裁决）；
+        // replaySentHighWaterSeq：本流内已实际发送过的最大 seqNo（流作用域；断线保留；F-2 作废；仅 7 处新任务开始调用点重置）；
+        // replayGapCounts：每 distinct 缺口的缺口触发重请求次数（候选界 10，待 P-6 裁决）。
+        let currentReplayRequestId = null;
+        let replayWaitTimer = null;
+        let replaySilentRetryCount = 0;
+        let replayExhausted = false;
+        let replayTailGap = false;
+        let replayLedger = new Map();
+        let replayTombstones = new Map();
+        let replayLedgerSeq = 0;
+        let replaySentHighWaterSeq = 0;
+        let replayGapCounts = new Map();
+
+        // S6：重置序号状态与三组状态（任务开始 / clearRecoveredData 清空时调用；不触碰显示数组本身）。
+        // S7 C3 P4 (k)/(m6)/(n11.2)/(n12.5)：新增清零项——当前请求身份、等待计时器、静默计数、
+        // 耗尽标志、缺口预算、账本活记录（入队未发的队列项随记录终结一并删除）；本流墓碑丢弃；
+        // 账本序号不重置（页面生命期内单调递增）。
+        // isStreamSwitch 为真仅当调用点是流切换（7 处新任务开始 + epoch 变化处置）：此时另重置流作用域变量
+        // （高水位 replaySentHighWaterSeq、尾部缺口标志 replayTailGap）；clearRecoveredData() 内的调用点
+        // 不得重置流作用域变量（W-2），调用时不传参。
+        function resetReplayState(isStreamSwitch) {
+            // 墓碑丢弃的流键须在清零前捕获（replayTaskId / currentBackgroundTaskId 随后即被清空）。
+            const flowTask = replayTaskId || currentBackgroundTaskId;
+            const flowEpoch = initConfigEpoch;
+            replayLastSeq = 0;
+            replayPending.clear();
+            replayState = 'idle';
+            replayTaskId = '';
+            replayThroughSeq = 0;
+            replayCompleteReceived = false;
+            if (replayGapTimer) { clearTimeout(replayGapTimer); replayGapTimer = null; }
+            typeTerminal = { scan: false, test: false, nsb: false, speed: false };
+            typeReconciled = { test: false, nsb: false };
+            if (replayWaitTimer) { clearTimeout(replayWaitTimer); replayWaitTimer = null; }
+            currentReplayRequestId = null;
+            replaySilentRetryCount = 0;
+            replayExhausted = false;
+            replayGapCounts.clear();
+            if (replayLedger.size > 0) {
+                const queuedIds = [];
+                for (const rec of replayLedger.values()) if (rec.state === 'queued') queuedIds.push(rec.requestId);
+                replayLedger.clear();
+                for (let i = 0; i < queuedIds.length; i++) dropQueuedReplayItem(queuedIds[i]);
+            }
+            if (replayTombstones.size > 0 && flowTask && flowEpoch) {
+                for (const [key, t] of Array.from(replayTombstones.entries())) {
+                    if (t.taskId === flowTask && t.backendEpoch === flowEpoch) replayTombstones.delete(key);
+                }
+            }
+            if (isStreamSwitch) {
+                replaySentHighWaterSeq = 0;
+                replayTailGap = false;
+            }
+        }
+
+        // S6：按类型把一行追加/更新到显示（复用现有显示函数，不改其语义；只决定“显示哪一行”，序号关卡在 applyResultRow）。
+        function displayReplayRow(type, row) {
+            if (type === 'scan') {
+                addScanResult(row, currentMode === 'official' && runningTaskMode !== 'nsb');
+            } else if (type === 'test') {
+                addTestResult(row, currentMode === 'official' && document.getElementById('test').classList.contains('active'));
+            } else if (type === 'nsb') {
+                if (nsbBatchSpeedRunning) updateNSBDisplayedResult(row);
+                else addNSBLiveResult(row, currentMode === 'nsb');
+            } else if (type === 'speed') {
+                updateSpeedResult(row);
+            }
+        }
+
+        // S6：消费一个连续行（调用方保证 seq == lastSeq + 1）。已对账类型只消费不显示（该行已在终态全量数组中）。
+        function consumeReplayRow(type, row, seq) {
+            if (typeReconciled[type]) {
+                replayLastSeq = seq;
+                return;
+            }
+            displayReplayRow(type, row);
+            replayLastSeq = seq;
+        }
+
+        // S6：按 seq 升序排空乱序缓冲（见设计 v7 §5.6.2 步骤 5；每次消费连续行后立即排空）。
+        function drainReplayPending() {
+            for (;;) {
+                let nextSeq = -1;
+                for (const seq of replayPending.keys()) {
+                    if (nextSeq < 0 || seq < nextSeq) nextSeq = seq;
+                }
+                if (nextSeq < 0) {
+                    if (replayGapTimer) { clearTimeout(replayGapTimer); replayGapTimer = null; }
+                    return;
+                }
+                if (nextSeq <= replayLastSeq) {
+                    replayPending.delete(nextSeq);
+                    continue;
+                }
+                if (nextSeq !== replayLastSeq + 1) return;
+                const entry = replayPending.get(nextSeq);
+                replayPending.delete(nextSeq);
+                consumeReplayRow(entry.type, entry.row, nextSeq);
+            }
+        }
+
+        // S6：缺口 2 秒超时重请求（见设计 v7 §5.6.3；建议值 2 秒，未测量）。
+        // S7 C3 P4 (l2)：每 distinct 缺口最多 10 次缺口触发重请求（候选值，待 P-6 裁决）；
+        // 预算耗尽置 replayExhausted=true（gap-exhausted），缓冲保留、水位保留，不重装计时器。
+        function scheduleReplayGapTimeout() {
+            if (replayGapTimer) return;
+            replayGapTimer = setTimeout(function () {
+                replayGapTimer = null;
+                if (replayPending.size === 0) return;
+                const gapSeq = replayLastSeq + 1;
+                for (const s of Array.from(replayGapCounts.keys())) { if (s <= replayLastSeq) replayGapCounts.delete(s); }
+                const used = replayGapCounts.get(gapSeq) || 0;
+                if (used >= 10) {
+                    replayExhausted = true;
+                    perfLog('ws_replay_gap_exhausted', 'gapSeq=' + gapSeq + ' budget=10');
+                    return;
+                }
+                replayGapCounts.set(gapSeq, used + 1);
+                const result = requestReplay('gap');
+                // 发送成功且缓冲仍非空且该缺口剩余预算 > 0 时，立即重新调度新的 2 秒缺口计时器。
+                if (result === true && replayPending.size > 0 && (replayGapCounts.get(gapSeq) || 0) < 10) scheduleReplayGapTimeout();
+            }, 2000);
+        }
+
+        // S6：按 §5.4.3 判定本次重放是否完成（两个条件缺一不可：已收到 replay_complete，且 lastSeq >= replayThroughSeq）。
+        function checkReplayComplete() {
+            if (replayState === 'done') return;
+            if (!replayCompleteReceived) return;
+            if (replayLastSeq < replayThroughSeq) return;
+            replayState = 'done';
+            perfLog('ws_replay_done', 'task=' + replayTaskId + ' lastSeq=' + replayLastSeq + ' through=' + replayThroughSeq);
+        }
+
+        // S6：统一序号关卡（见设计 v7 §5.6.2）。所有逐行结果（实时行与重放行）都经过本函数。
+        // 顺序强制：先序号连续性检查，后对账检查。无 seq 的行（旧后端 / follow 重发）直接显示，不参与序号空间。
+        // S7 C3 P4 (i)/(j)：行到达钩子（handleMessage 行分支入口，去重检查之前；重复行同样触发）——
+        // 任一行到达即清零静默计数；耗尽后行到达且等待计时器未在运行时，以当前请求重启等待计时器
+        // （2 秒候选；不发送、不覆盖 currentReplayRequestId、清除耗尽标志）。行到达不再取消、
+        // 也不再重置已在运行的等待计时器。
+        // S7 C3 P1 (n10)：行流身份检查（测试 160，协调方裁决 C-R10；
+        //   state-machine §2.2 事件 12 / implementation-plan 第 5 项 (n10)）。
+        // 后端行载荷只带 seq，不带 taskId/backendEpoch（session.go withSeq、
+        // sendTaskResult 只注入 seq；旧任务 worker 的行由后端 send_stale_task
+        // 守卫丢弃），故逐行字段比对无从执行；检查改为流级：在消费前核对当前流身份——
+        // 重放中以 replayTaskId 为流任务，实时以当前前台/跟随后台任务为流任务，
+        // epoch 一律与 initConfigEpoch 比对。任一核对失败 → 整行丢弃、零效应
+        // （不推进水位、不入缓冲、不调度缺口计时器、不清零静默计数、不重启等待
+        // 计时器、不改任何状态）；D-5(c) 下归属为“不可判定”的流同样不归因（行丢弃、不终止）。
+        function rowStreamIdentityAllows() {
+            let streamTaskId = '';
+            let streamEpoch = '';
+            if (replayState === 'requesting' || replayState === 'replaying') {
+                if (!replayTaskId) return false;
+                if (foregroundTaskIdentity && foregroundTaskIdentity.taskId === replayTaskId) {
+                    streamTaskId = replayTaskId;
+                    streamEpoch = foregroundTaskIdentity.backendEpoch;
+                } else if (currentBackgroundTaskId && currentBackgroundTaskId === replayTaskId) {
+                    streamTaskId = replayTaskId;
+                    streamEpoch = initConfigEpoch;
+                } else {
+                    return false;
+                }
+            } else if (foregroundTaskIdentity) {
+                streamTaskId = foregroundTaskIdentity.taskId;
+                streamEpoch = foregroundTaskIdentity.backendEpoch;
+            } else if (currentBackgroundTaskId) {
+                streamTaskId = currentBackgroundTaskId;
+                streamEpoch = initConfigEpoch;
+            } else {
+                return false;
+            }
+            if (!streamTaskId || !streamEpoch || !initConfigEpoch || streamEpoch !== initConfigEpoch) return false;
+            // D-5(c)：归属为“不可判定”的流不归因——其行丢弃、不终止。
+            if (foregroundTaskIdentity && foregroundTaskIdentity.taskId === streamTaskId && foregroundTaskIdentity.terminalAttribution === 'undecided') return false;
+            for (let i = 0; i < backgroundIdentities.length; i++) {
+                const rec = backgroundIdentities[i];
+                if (rec.taskId === streamTaskId && rec.backendEpoch === streamEpoch && rec.terminalAttribution === 'undecided') return false;
+            }
+            return true;
+        }
+
+        function applyResultRow(type, row) {
+            // S7 C3 P5/F-2 + P4 M-5（状态机 §2.2 暂缓与超时 / 设计 B §D；§2.3 missing/epoch 表）：
+            // 已终结流（F-2 到期转 missing，或 epoch 变化旧流作废）的迟到行一律丢弃，零效应——
+            // 不消费、不缓冲、不调度缺口计时器、不推进水位、不重开重放、不重置恢复计时。
+            // 行本身无任务/epoch 字段：标记存续且当前无已采用的新流身份（或仍为标记流身份）时丢弃；
+            // 一旦采用了不同流的身份（新任务/找到的新后台任务），标记即失效，放行新流行。
+            // 注：(n10) 流身份检查同样会在无身份时丢弃本行；本门覆盖其不覆盖的情形——
+            // 已终结流的身份被 late found 重新采用后，行仍须按 F-2/epoch 已终结丢弃，不得复活。
+            if (expiredStreamRowGuard) {
+                const curTask = (foregroundTaskIdentity && foregroundTaskIdentity.taskId) || currentBackgroundTaskId || replayTaskId;
+                const curEpoch = (foregroundTaskIdentity && foregroundTaskIdentity.backendEpoch) || initConfigEpoch;
+                if (!curTask || (curTask === expiredStreamRowGuard.taskId && curEpoch === expiredStreamRowGuard.backendEpoch)) {
+                    perfLog('ws_row_discarded_expired_stream', 'type=' + type + ' seq=' + ((row && row.seq) || '') + ' reason=' + expiredStreamRowGuard.reason);
+                    return;
+                }
+                expiredStreamRowGuard = null;
+            }
+            // S7 C3 P1 (n10)：唯一入口（scan/test/speed/nsb 四路均经此函数）。
+            // 检查失败 → 整行丢弃、零效应；检查本身不改任何状态。
+            if (!rowStreamIdentityAllows()) {
+                perfLog('ws_row_stream_mismatch_dropped', 'type=' + type + ' seq=' + (row && row.seq));
+                return;
+            }
+            if (replayState === 'requesting' || replayState === 'replaying') {
+                replaySilentRetryCount = 0;
+                if (replayExhausted && !replayWaitTimer && currentReplayRequestId) {
+                    replayExhausted = false;
+                    armReplayWaitTimer(currentReplayRequestId, 'response', 2000);
+                }
+            }
+            const seq = row && row.seq;
+            if (typeof seq !== 'number' || !Number.isFinite(seq)) {
+                displayReplayRow(type, row);
+                return;
+            }
+            if (replayState === 'requesting') replayState = 'replaying';
+            if (seq <= replayLastSeq) return;
+            if (replayPending.has(seq)) return;
+            if (seq > replayLastSeq + 1) {
+                if (replayPending.size >= 64) {
+                    replayPending.clear();
+                    requestReplay('buffer-full');
+                }
+                replayPending.set(seq, { type: type, row: row });
+                scheduleReplayGapTimeout();
+                return;
+            }
+            consumeReplayRow(type, row, seq);
+            drainReplayPending();
+            checkReplayComplete();
+        }
+
+        // S7 C3 P4 (m)：请求生命周期账本辅助。活记录 7 个存储字段
+        // （requestId / taskId / backendEpoch / sentAt / seqNo / state / trigger）；
+        // 是否属于当前请求、是否计入在途上限均为派生谓词，不存储。
+        // state：queued / inflight / completed / rejected / replaced / expired。
+        function ledgerSetState(requestId, state) {
+            const rec = replayLedger.get(requestId);
+            if (!rec) return false;
+            rec.state = state;
+            if (state === 'completed' || state === 'rejected' || state === 'replaced' || state === 'expired') {
+                dropQueuedReplayItem(requestId);
+                pruneReplayLedger();
+            }
+            return true;
+        }
+
+        // S7 C3 P4 (m1)：容量（PROVISIONAL，待 L-3 裁决）——活记录 ≤12（在途 ≤4 + 终态 ≤8）、墓碑 ≤16；
+        // 活终态超界时 seqNo 最小者降级为墓碑；墓碑超界时 seqNo 最小者彻底丢弃。
+        // 墓碑丢失只改变诊断标签，不改变接受/丢弃结局。
+        function pruneReplayLedger() {
+            let terminal = [];
+            for (const rec of replayLedger.values()) {
+                if (rec.state === 'completed' || rec.state === 'rejected' || rec.state === 'replaced' || rec.state === 'expired') terminal.push(rec);
+            }
+            while (replayLedger.size > 12 && terminal.length > 0) {
+                terminal.sort((a, b) => a.seqNo - b.seqNo);
+                const victim = terminal.shift();
+                replayLedger.delete(victim.requestId);
+                replayTombstones.set(victim.requestId, { requestId: victim.requestId, taskId: victim.taskId, backendEpoch: victim.backendEpoch, seqNo: victim.seqNo, terminalState: victim.state, terminalAt: Date.now() });
+            }
+            while (replayTombstones.size > 16) {
+                let minKey = null;
+                let minSeq = Infinity;
+                for (const [k, t] of replayTombstones) {
+                    if (t.seqNo < minSeq) { minSeq = t.seqNo; minKey = k; }
+                }
+                if (minKey === null) break;
+                replayTombstones.delete(minKey);
+            }
+        }
+
+        // S7 C3 P4 (l1)：同一 (taskId, backendEpoch) 下已发送未答复的重放请求数（只数 inflight，不数 queued）。
+        function replayInflightCount(taskId, epoch) {
+            let n = 0;
+            for (const rec of replayLedger.values()) {
+                if (rec.state === 'inflight' && rec.taskId === taskId && rec.backendEpoch === epoch) n++;
+            }
+            return n;
+        }
+
+        // S7 C3 P4 (l1)/B-R5：到上限时非超时触发取代最旧的在途请求（seqNo 最小者 → replaced，槽位释放）。
+        // 取代只改客户端 tracked 集与归属判定，不取消后端执行。当前请求是 seqNo 最大者，永不被取代
+        // （M-R2 括号句为防御性条件规则：其前件在上限 4 下不可达，见 C-R41-5）。
+        function replaceOldestInflight(taskId, epoch) {
+            let oldest = null;
+            for (const rec of replayLedger.values()) {
+                if (rec.state !== 'inflight' || rec.taskId !== taskId || rec.backendEpoch !== epoch) continue;
+                if (!oldest || rec.seqNo < oldest.seqNo) oldest = rec;
+            }
+            if (!oldest) return;
+            if (oldest.requestId === currentReplayRequestId) currentReplayRequestId = null;
+            ledgerSetState(oldest.requestId, 'replaced');
+            perfLog('ws_replay_replaced_oldest', 'requestId=' + oldest.requestId + ' seqNo=' + oldest.seqNo);
+        }
+
+        // S7 C3 P4 (n5)/(n12.1)：旧请求的迟到完成/拒绝到达时，只终结自己的账本记录（R-L3），
+        // 不驱动当前恢复状态转换。仅当记录存在且为 inflight/queued 时终结。
+        function terminateLedgerRecordForLateResponse(requestId, outcome) {
+            if (typeof requestId !== 'string' || !requestId) return;
+            const rec = replayLedger.get(requestId);
+            if (!rec) return;
+            if (rec.state !== 'inflight' && rec.state !== 'queued') return;
+            ledgerSetState(requestId, outcome);
+        }
+
+        // S7 C3 P4 (h)：取消重放等待计时器（置 null）。
+        function cancelReplayWaitTimer() {
+            if (replayWaitTimer) { clearTimeout(replayWaitTimer); replayWaitTimer = null; }
+        }
+
+        // S7 C3 P4 (h)：武装重放等待计时器。每次发送先 clearTimeout 旧计时器并置 null 再建新计时器；
+        // 回调捕获本次 requestId 与角色、任务与代次，先到者胜、后到者 inert。
+        // 角色：'response'（等待本请求的完成/拒绝响应）/ 'rejection-followup'（R-R1 跟进）/ 'tail-gap'（尾部缺口等待）。
+        function armReplayWaitTimer(requestId, role, delayMs) {
+            cancelReplayWaitTimer();
+            const capturedRequestId = requestId;
+            const capturedRole = role;
+            const capturedTaskId = replayTaskId || currentBackgroundTaskId;
+            const capturedEpoch = initConfigEpoch;
+            replayWaitTimer = setTimeout(function () {
+                replayWaitTimer = null;
+                onReplayWaitTimeout(capturedRequestId, capturedRole, capturedTaskId, capturedEpoch);
+            }, delayMs);
+        }
+
+        // S7 C3 P4 (h)/(i)/(n5)/(n12.2)/(n13.1)：重放等待计时器回调。
+        // response 角色双重核对：captured === currentReplayRequestId 且 replayState ∈ {requesting, replaying}；
+        // tail-gap 角色四项核对：F-2 未到达、replayTailGap 仍为 true、流身份未变、replayState ∈ {requesting, replaying}；
+        // rejection-followup 角色核对状态与流身份（等待期间身份恒为 null，故不核对 captured === current）。
+        // 任一核对失败 → 静默 inert（不发送、不计数、不改状态）。
+        function onReplayWaitTimeout(capturedRequestId, role, capturedTaskId, capturedEpoch) {
+            if (isF2Reached()) return;
+            if (replayState !== 'requesting' && replayState !== 'replaying') return;
+            if ((replayTaskId || currentBackgroundTaskId) !== capturedTaskId || initConfigEpoch !== capturedEpoch) return;
+            if (role === 'tail-gap') {
+                if (!replayTailGap) return;
+                // 尾部缺口触发：计数 +1（触发时计，无论随后发送成功/失败/入队）；进入时不 +1。
+                if (replaySilentRetryCount >= 3) {
+                    replayExhausted = true;
+                    replayTailGap = false;
+                    perfLog('ws_replay_tail_gap_exhausted', 'task=' + capturedTaskId);
+                    return;
+                }
+                replaySilentRetryCount += 1;
+                const result = requestReplay('tail-gap');
+                if (result === false) {
+                    // R1 有界重调度：触发后计数 < 3 时重装尾部缺口等待（重装本身不消耗预算）；
+                    // 计数已为 3 时不重装，进入耗尽（事件 14 第三条进入条件）。
+                    if (replaySilentRetryCount < 3) armReplayWaitTimer(capturedRequestId, 'tail-gap', 2000);
+                    else {
+                        replayExhausted = true;
+                        replayTailGap = false;
+                        perfLog('ws_replay_tail_gap_exhausted', 'task=' + capturedTaskId);
+                    }
+                }
+                // 'queued' → 标志保持真（R2），不武装计时器；true → M-R6 已清除标志并转入等待响应。
+                return;
+            }
+            if (role === 'rejection-followup') {
+                // R-R1 跟进发送：尝试发送时计数 +1（无论 true / 'queued' / false——尝试即计数）。
+                replaySilentRetryCount += 1;
+                requestReplay('rejection-followup');
+                return;
+            }
+            // response 角色：双重核对。
+            if (capturedRequestId !== currentReplayRequestId) return;
+            if (replaySilentRetryCount >= 3) {
+                // 计数已为 3：不再重请求，进入耗尽状态（保持 replaying、停表、缺口计时器继续兜底）。
+                replayExhausted = true;
+                perfLog('ws_replay_timeout_exhausted', 'task=' + capturedTaskId + ' requestId=' + capturedRequestId);
+                return;
+            }
+            // 超时触发时 +1（触发时计，无论随后发送成功、失败或入队）。
+            replaySilentRetryCount += 1;
+            requestReplay('timeout');
+        }
+
+        // S7 C3 P4 (n1)/M-R6：实际发送确认时的三步（同一同步步骤内）——
+        // (1) 创建或转移账本记录为 inflight（sentAt = 实际发送时刻，trigger = 本次触发）；
+        // (2) currentReplayRequestId 置为新 requestId（只在实际发送确认时向前赋值）；
+        // (3) 为新请求启动等待计时器（首次 5 秒 / 后续 2 秒，均为推荐值待裁决）。
+        // 另：高水位仅实际发送确认时推进；进展驱动的实际发送清零静默计数；
+        // 新请求开启新等待链，耗尽标志清除；消解本次尾部缺口等待的发送清除 replayTailGap
+        // （更新请求的实际发送不清除，C-R43-6——此处仅 trigger === 'tail-gap' 时清除）。
+        function applyReplaySendConfirmed(requestId, seqNo, trigger, taskId, epoch) {
+            let rec = replayLedger.get(requestId);
+            if (rec) {
+                rec.state = 'inflight';
+                rec.sentAt = Date.now();
+            } else {
+                replayLedger.set(requestId, { requestId: requestId, taskId: taskId, backendEpoch: epoch, sentAt: Date.now(), seqNo: seqNo, state: 'inflight', trigger: trigger });
+            }
+            currentReplayRequestId = requestId;
+            if (seqNo > replaySentHighWaterSeq) replaySentHighWaterSeq = seqNo;
+            if (trigger === 'gap' || trigger === 'buffer-full' || trigger === 'boundary-extension' || trigger === 'found' || trigger === 'following') replaySilentRetryCount = 0;
+            replayExhausted = false;
+            if (trigger === 'tail-gap') replayTailGap = false;
+            armReplayWaitTimer(requestId, 'response', replaySilentRetryCount === 0 ? 5000 : 2000);
+        }
+
+        // S7 C3 P4：当前重放任务是否已终态确认（前台身份 / 后台记录 / 终态收据单例任一为 confirmed）。
+        function isReplayTaskConfirmed() {
+            if (foregroundTaskIdentity && foregroundTaskIdentity.taskId === replayTaskId && foregroundTaskIdentity.terminalAttribution === 'confirmed') return true;
+            if (lastTerminalIdentity && lastTerminalIdentity.taskId === replayTaskId && lastTerminalIdentity.backendEpoch === initConfigEpoch) return true;
+            for (let i = 0; i < backgroundIdentities.length; i++) {
+                const rec = backgroundIdentities[i];
+                if (rec.taskId === replayTaskId && rec.terminalAttribution === 'confirmed') return true;
+            }
+            return false;
+        }
+
+        // S6：发送重放请求（见设计 v7 §5.4.5 选 B：每次生成新的 requestId；服务端不去重，前端按 seq 去重）。
+        // 仅后台任务可重放（须已知任务 ID 与 epoch）；旧后端（无 resultReplay 能力）不发送。
+        // S7 C3 P4 (n7)：心跳式严格三态分流（result === false / === 'queued' / === true），
+        // 不再把 'queued'（真值）当成功。trigger 枚举：'initial' | 'timeout' | 'gap' |
+        // 'buffer-full' | 'boundary-extension' | 'found' | 'following' |
+        // 'rejection-followup' | 'tail-gap'（第 7 存储字段，见 (n4)）。
+        // 认领状态守卫（P4 (b)，裁决项 14）：仅 replaying 或既有后台路径（found/following）
+        // 或认领刚成功（claimState === 'accepted'，本调用消费）允许发起；认领未决时拦截重放抢跑。
+        function requestReplay(trigger) {
+            trigger = trigger || 'initial';
+            const claimAccepted = (claimState === 'accepted');
+            if (claimAccepted) claimState = 'idle';
+            if (!resultReplaySupported) return false;
+            if (claimState === 'claiming') {
+                perfLog('ws_replay_blocked_claiming', 'trigger=' + trigger);
+                return false;
+            }
+            if (replayState === 'done' && trigger !== 'found' && trigger !== 'following') return false;
+            if (replayState === 'idle' && trigger !== 'found' && trigger !== 'following' && !claimAccepted) {
+                perfLog('ws_replay_blocked_idle', 'trigger=' + trigger);
+                return false;
+            }
+            const taskId = currentBackgroundTaskId || replayTaskId;
+            const epoch = initConfigEpoch;
+            if (!taskId || !epoch) {
+                perfLog('ws_replay_skipped', 'reason=no-task-or-epoch');
+                return false;
+            }
+            // S7 C3 P5/F-2（状态机 §2.2 :316、设计 B §D）：F-2 到达后 0 次新增请求。
+            // 直接发送路径此前无 F-2 门（flush 四门之门 2 只覆盖入队项；isF2Reached() 在 F-2 到期后
+            // 因 f2DeadlineTimestamp 已清零而恒为 false，故此处以已终结流标记核对；仅拦截标记流本身的请求——
+            // 例如 late found 重新采用已终结流身份后的重放；新流 task_started 采用时已清除标记，不受影响）。
+            if (expiredStreamRowGuard && taskId === expiredStreamRowGuard.taskId && epoch === expiredStreamRowGuard.backendEpoch) {
+                perfLog('ws_replay_blocked_expired_stream', 'task=' + taskId + ' trigger=' + trigger + ' reason=' + expiredStreamRowGuard.reason);
+                return false;
+            }
+            // seqNo 创建时即分配（C-R41-1）：每次创建恰好消耗一个 seqNo，发送失败亦消耗，序列可有空洞。
+            replayLedgerSeq += 1;
+            const seqNo = replayLedgerSeq;
+            const requestId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('replay-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
+            const payload = { type: 'replay_results', data: { taskId: taskId, backendEpoch: epoch, lastSeq: replayLastSeq, requestId: requestId } };
+            // 积压上限 B-R1（P4 (l1)）：同一 (taskId, backendEpoch) 下已发送未答复 ≤4。
+            if (replayInflightCount(taskId, epoch) >= 4) {
+                if (trigger === 'timeout') {
+                    // B-R4：超时触发到上限时跳过本次发送、停表、不重装，记诊断（L-1 待确认，不置 replayExhausted）。
+                    perfLog('ws_replay_cap_exhausted', 'task=' + taskId + ' trigger=timeout seqNo=' + seqNo);
+                    return false;
+                }
+                replaceOldestInflight(taskId, epoch);
+            }
+            const result = wsSend(payload);
+            if (result === false) {
+                // 事件 2：发送失败——不建记录、不置身份、不启动计时器（seqNo 已消耗为空洞）。
+                perfLog('ws_replay_send_failed', 'task=' + taskId + ' trigger=' + trigger + ' seqNo=' + seqNo);
+                return false;
+            }
+            if (result === 'queued') {
+                // 事件 16：入队——建 queued 记录，不计入在途、不置身份、不启动计时器、不置 replayState。
+                replayLedger.set(requestId, { requestId: requestId, taskId: taskId, backendEpoch: epoch, sentAt: null, seqNo: seqNo, state: 'queued', trigger: trigger });
+                pruneReplayLedger();
+                perfLog('ws_replay_queued', 'task=' + taskId + ' lastSeq=' + replayLastSeq + ' requestId=' + requestId + ' trigger=' + trigger);
+                return 'queued';
+            }
+            // 事件 1：实际发送确认——M-R6 三步（记录 → inflight、身份赋值、启动等待计时器）。
+            applyReplaySendConfirmed(requestId, seqNo, trigger, taskId, epoch);
+            replayTaskId = taskId;
+            replayThroughSeq = 0;
+            replayCompleteReceived = false;
+            replayState = 'requesting';
+            perfLog('ws_replay_requested', 'task=' + taskId + ' lastSeq=' + replayLastSeq + ' requestId=' + requestId + ' trigger=' + trigger);
+            return true;
+        }
+
+        // S7 C3 P2/P3：认领发送与重试辅助（状态机 §2.2/§3.2–§3.3；实施计划 P2 §5/P3）。
+        // F-2 是否已到达（唯一总截止；未设置则未到达）。
+        function isF2Reached() {
+            return f2DeadlineTimestamp !== null && f2DeadlineTimestamp !== undefined && Date.now() >= f2DeadlineTimestamp;
+        }
+
+        // 停全部认领定时器（等待/重试/轮询）。
+        function stopClaimTimers() {
+            if (claimWaitTimer) { clearTimeout(claimWaitTimer); claimWaitTimer = null; }
+            if (claimRetryTimer) { clearTimeout(claimRetryTimer); claimRetryTimer = null; }
+            if (claimPollTimer) { clearTimeout(claimPollTimer); claimPollTimer = null; }
+        }
+
+        // S7 C3 P3 (f)：代次变化——取消旧定时器、计数清零、新代次重新开始；F-2 不重置。
+        function resetClaimForNewGeneration() {
+            stopClaimTimers();
+            claimSentCount = 0;
+            claimPhase = 'first';
+            claimState = 'idle';
+            claimLastReason = '';
+            claimPollLastSent = 0;
+        }
+
+        // S7 C3 P2 §5(a)：首次认领发送。注册成功 + 代次有效 + 串行化空闲时调用；
+        // 字段必填 taskId/backendEpoch/pageId（均 TrimSpace 非空），无 requestId；
+        // 发送失败不计入计数（sendClaimAttempt 内处理）。
+        function sendFirstClaimAfterAck() {
+            if (claimState !== 'idle') return;
+            if (!foregroundTaskIdentity) return;
+            claimPhase = 'first';
+            claimSentCount = 0;
+            claimLastReason = '';
+            sendClaimAttempt();
+        }
+
+        // S7 C3 P2：一次认领发送尝试。串行化：已有在途认领等待时不重复发送；
+        // 认领不进入可跨代次重放的 wsSend 排队分类（直接走 wsSendRaw，失败即 false，不入队）。
+        // 成功时 claimSentCount += 1（首次成功后为 1），武装 2 秒认领等待计时器。
+        function sendClaimAttempt() {
+            if (claimWaitTimer !== null && claimWaitTimer !== undefined) return false;
+            const ident = foregroundTaskIdentity;
+            if (!ident) return false;
+            const taskId = (ident.taskId || '').trim();
+            const epoch = (ident.backendEpoch || '').trim();
+            const pid = (pageId || '').trim();
+            if (!taskId || !epoch || !pid) return false;
+            if (!initConfigEpoch || initConfigEpoch !== epoch) return false;
+            if (!ws || ws.readyState !== WebSocket.OPEN || !pageRegistered) return false;
+            if (registerRejectedStop) return false;
+            if (isF2Reached()) return false;
+            const payload = { type: 'resume_foreground_task', data: { taskId: taskId, backendEpoch: epoch, pageId: pid } };
+            if (wsSendRaw(payload) !== true) return false;
+            claimSentCount += 1;
+            claimPollLastSent = Date.now();
+            claimGen = perfConnSeq;
+            claimState = 'claiming';
+            armClaimWaitTimer();
+            perfLog('ws_claim_sent', 'task=' + taskId + ' count=' + claimSentCount + ' phase=' + claimPhase);
+            return true;
+        }
+
+        // S7 C3 P2 §5(f)/状态机 §4.1：认领等待超时 2 秒（建议值，裁决项 16 的一部分），按无应答处理。
+        // 每次认领请求独立计时；回调核对代次与令牌，旧代次/旧令牌直接失效。
+        function armClaimWaitTimer() {
+            if (claimWaitTimer) { clearTimeout(claimWaitTimer); claimWaitTimer = null; }
+            const gen = perfConnSeq;
+            const token = currentRecoveryToken;
+            claimWaitTimer = setTimeout(function () {
+                claimWaitTimer = null;
+                if (gen !== perfConnSeq) return;
+                if (token !== currentRecoveryToken) return;
+                if (claimState !== 'claiming') return;
+                if (isF2Reached()) return;
+                perfLog('ws_claim_wait_timeout', 'task=' + (foregroundTaskIdentity ? foregroundTaskIdentity.taskId : '') + ' count=' + claimSentCount + ' phase=' + claimPhase);
+                scheduleClaimRetryAfterNoAnswer();
+            }, 2000);
+        }
+
+        // S7 C3 P3：无应答（瞬态拒绝或等待超时）后的重试调度。
+        // 第一阶段：claimSentCount < 4 时 500ms 后重试；耗尽且最近理由为 task-not-found → 终态 missing；
+        // 耗尽且为 not-pending → 第二阶段（计数重置为 0，独立计数）。第二阶段同理，耗尽后转低频轮询。
+        // F-2 到达后 0 次新增请求。
+        function scheduleClaimRetryAfterNoAnswer() {
+            if (isF2Reached()) { stopClaimTimers(); return; }
+            if (claimState !== 'claiming') return;
+            if (claimPhase === 'first') {
+                if (claimSentCount < 4) {
+                    armClaimRetryTimer(500);
+                    return;
+                }
+                if (claimLastReason === 'task-not-found') { claimEnterMissing('task-not-found'); return; }
+                claimPhase = 'second';
+                claimSentCount = 0;
+                perfLog('ws_claim_phase_second', '');
+                armClaimRetryTimer(500);
+                return;
+            }
+            if (claimPhase === 'second') {
+                if (claimSentCount < 4) {
+                    armClaimRetryTimer(500);
+                    return;
+                }
+                if (claimLastReason === 'task-not-found') { claimEnterMissing('task-not-found'); return; }
+                claimPhase = 'polling';
+                perfLog('ws_claim_phase_polling', '');
+                scheduleClaimPoll();
+                return;
+            }
+            scheduleClaimPoll();
+        }
+
+        // S7 C3 P3：认领重试定时器（只调度认领请求发送，与重连退避、replay 重试严格分离）。
+        function armClaimRetryTimer(delayMs) {
+            if (claimRetryTimer) { clearTimeout(claimRetryTimer); claimRetryTimer = null; }
+            const gen = perfConnSeq;
+            const token = currentRecoveryToken;
+            claimRetryTimer = setTimeout(function () {
+                claimRetryTimer = null;
+                if (gen !== perfConnSeq) return;
+                if (token !== currentRecoveryToken) return;
+                if (claimState !== 'claiming') return;
+                if (isF2Reached()) return;
+                sendClaimAttempt();
+            }, delayMs);
+        }
+
+        // S7 C3 P3：低频轮询调度。间隔 5 秒（建议值待裁决）、速率每 5 秒最多 1 次、独立 claimPollTimer；
+        // 延迟按限速时间戳计算（delay = max(0, 5000 - (now - lastSent))）；发送失败时按 5 秒重建，不忙等。
+        function scheduleClaimPoll(forceDelayMs) {
+            if (claimPollTimer) { clearTimeout(claimPollTimer); claimPollTimer = null; }
+            if (claimState !== 'claiming' || claimPhase !== 'polling') return;
+            if (isF2Reached()) return;
+            const delay = (typeof forceDelayMs === 'number') ? forceDelayMs :
+                (claimPollLastSent ? Math.max(0, 5000 - (Date.now() - claimPollLastSent)) : 5000);
+            const gen = perfConnSeq;
+            const token = currentRecoveryToken;
+            claimPollTimer = setTimeout(function () {
+                claimPollTimer = null;
+                if (gen !== perfConnSeq) return;
+                if (token !== currentRecoveryToken) return;
+                if (claimState !== 'claiming' || claimPhase !== 'polling') return;
+                if (isF2Reached()) return;
+                if (claimWaitTimer !== null && claimWaitTimer !== undefined) { scheduleClaimPoll(); return; }
+                if (sendClaimAttempt()) return;
+                scheduleClaimPoll(5000);
+            }, delay);
+        }
+
+        // S7 C3 P2/P3：终态拒绝后的前台恢复清理（不碰后台身份记录与显示数据）。
+        // 停 F-2、清前台身份与恢复上下文、结束恢复等待；身份已终结，任务 UI 随之结束。
+        function clearForegroundRecoveryForTerminal(reason) {
+            const ident = foregroundTaskIdentity;
+            stopF2Timers();
+            endRecoveryWait();
+            if (ident && backgroundRecoveryContexts[ident.taskId]) delete backgroundRecoveryContexts[ident.taskId];
+            if (ident) foregroundTaskIdentity = null;
+            currentRecoveryToken = null;
+            f2DeadlineTimestamp = null;
+            updateStatus('任务恢复已终止（' + reason + '）', false);
+            log('认领被拒绝（' + reason + '），已停止恢复');
+            if (isTaskRunning || backgroundTaskActive) finishRunningTask('✨ 开始扫描与测试');
+        }
+
+        // S7 C3 P2/P3：task-not-found 第一阶段耗尽后仍持续 → 终态 missing。
+        // 按 background_task_missing 路径清空旧数据（等待仍针对旧任务、旧数据时才清空）。
+        function claimEnterMissing(reason) {
+            stopClaimTimers();
+            claimState = 'idle';
+            perfLog('ws_claim_missing', 'reason=' + reason);
+            if (recoveryStillTargetsOldTask()) {
+                clearRecoveredData();
+                currentBackgroundTaskId = '';
+                backgroundTaskActive = false;
+                backgroundTaskFollowing = false;
+                stopBackgroundStatusPolling();
+            }
+            clearForegroundRecoveryForTerminal(reason);
+        }
+
+        // 第一阶段性能日志：仅输出 console 日志，不改变任何行为。
+        // perfConnSeq 为前端本地 WS 连接尝试代次；perfConnId 取自 init_config.connectionId（后端分配），仅用于日志关联同一条连接。
+        let perfConnSeq = 0;
+        let perfConnId = '';
+        function perfLog(event, details) {
+            try { console.log('[perf ts=' + new Date().toISOString() + ' event=' + event + ' conn=' + (perfConnId || ('js-ws-' + perfConnSeq)) + (details ? ' ' + details : '') + ']'); } catch (e) {}
+        }
+
+        // 退避延迟：500、1000、2000、3000（上限），由 reconnectAttempt 决定。
+        function reconnectDelayMs() {
+            return Math.min(RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempt), RECONNECT_MAX_DELAY_MS);
+        }
+
+        // 安排一次重连（统一入口）。同一时刻最多一个定时器；后台不安排，
+        // 等前台 visibilitychange 立即尝试；回调校验代次，旧代次直接丢弃。
+        function scheduleReconnect(gen) {
+            // 第四阶段 B 批次 R3：注册连续被拒 3 次后停止重连（见设计 v22.2 §1.7），
+            // 需用户手动刷新页面恢复。
+            if (registerRejectedStop) return;
+            // 已有待处理的重连时不再重复安排（同一时刻最多一个重连定时器）。
+            if (reconnecting) return;
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            if (document.visibilityState !== 'visible') {
+                // 后台不做无意义的重连；回前台时 visibilitychange 会立即尝试。
+                reconnecting = false;
+                return;
+            }
+            reconnecting = true;
+            const delay = reconnectDelayMs();
+            reconnectAttempt += 1;
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                reconnecting = false;
+                if (gen !== perfConnSeq) return;
+                connect();
+            }, delay);
+        }
+
+        function stopHeartbeat() {
+            if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+            if (heartbeatAckTimer) { clearTimeout(heartbeatAckTimer); heartbeatAckTimer = null; }
+        }
+
+        // 发送一次心跳并开始等待确认；确认超时则判定连接失效，走统一重连流程。
+        // gen 为发送时连接代次，超时回调先校验代次。
+        function sendHeartbeat(gen) {
+            // 第四阶段 B 批次 R3：wsSend 现为三态；只有真正发出（true）才等待确认，
+            // 入队（'queued'）的心跳尚未上网，不启动确认超时。
+            if (wsSend({ type: 'heartbeat', data: {} }) !== true) return;
+            if (heartbeatAckTimer) { clearTimeout(heartbeatAckTimer); heartbeatAckTimer = null; }
+            heartbeatAckTimer = setTimeout(() => {
+                heartbeatAckTimer = null;
+                if (gen !== perfConnSeq) return;
+                if (document.visibilityState !== 'visible') return;
+                // 确认超时：连接视为失效，关闭后走统一重连流程。
+                perfLog('ws_heartbeat_timeout', 'gen=' + gen);
+                closeCurrentSocket();
+                scheduleReconnect(gen);
+            }, HEARTBEAT_ACK_TIMEOUT_MS);
+        }
+
+        function startHeartbeat(gen) {
+            stopHeartbeat();
+            // 第四阶段 B 批次 R3：心跳只在注册确认后运行（见设计 v22.2 §1.8）。
+            // onopen 不再启动心跳；启动点在 register_page_ack 处理函数。
+            if (!pageRegistered) return;
+            // 立即验证一次，再按间隔周期发送。
+            sendHeartbeat(gen);
+            heartbeatTimer = setInterval(() => {
+                if (gen !== perfConnSeq) { stopHeartbeat(); return; }
+                if (document.visibilityState !== 'visible') return;
+                sendHeartbeat(gen);
+            }, HEARTBEAT_INTERVAL_MS);
+        }
+
+        // 关闭当前 socket（不触发重连逻辑，由调用方决定是否重连）。
+        // 先解除回调再关闭，避免旧回调干扰新连接。
+        function closeCurrentSocket() {
+            const socket = ws;
+            if (!socket) return;
+            socket.onopen = null;
+            socket.onmessage = null;
+            socket.onclose = null;
+            socket.onerror = null;
+            try { socket.close(); } catch (e) {}
+            if (ws === socket) ws = null;
+        }
+
+        // 结束一次重连恢复等待（找到任务、确认无任务或超时兜底）。
+        function endRecoveryWait() {
+            recoveryPending = false;
+            recoveryGen = 0;
+            if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+        }
+
+        // 数据变更代次：scanData/testData/dcList 每次业务性写入时递增。
+        // 递增入口：addScanResult、addTestResult、扫描开始清空、
+        // 详细测试开始清空、scan_complete_wait_dc 的 dcList 替换、
+        // test_complete 的 testData 替换。仅排序/重排不递增；
+        // 恢复流程自身的清空也不递增（等待即将结束，无后续比较）。
+        function bumpDataGen() {
+            dataGen += 1;
+        }
+
+        // 本次恢复等待是否仍针对等待开始时的旧任务与旧数据（两者都未变）。
+        // 只要其一变了，说明等待期间已有新任务或新数据，超时/missing 不得再按旧任务处理。
+        function recoveryStillTargetsOldTask() {
+            return dataGen === recoveryDataGen && currentBackgroundTaskId === recoveryTaskId;
+        }
+
+        // 确认旧会话数据不可恢复时清空（与原 onopen 重连清理同一份逻辑）。
+        // 数据代次已变（等待期间已有新任务产生数据）则不清空，只结束等待。
+        // 返回是否实际清空。
+        function clearRecoveredData() {
+            if (dataGen !== recoveryDataGen) return false;
+            scanData = [];
+            testData = [];
+            dcList = [];
+            testedDCs.clear();
+            currentTestingDC = '';
+            scanResultsCount = 0;
+            testResultsCount = 0;
+            updateBadge('scanCount', 0);
+            updateBadge('testCount', 0);
+            updateBadge('dcCount', 0);
+            document.querySelector('#scanTable tbody').innerHTML = '';
+            document.querySelector('#dcTable tbody').innerHTML = '';
+            document.querySelector('#testTable tbody').innerHTML = '';
+            document.getElementById('dcSection').style.display = 'none';
+            // S6：清空恢复数据的同时重置序号状态与三组状态（不补清 nsb 实时行，见已批准基线 #10）。
+            resetReplayState();
+            return true;
+        }
+
+        // S7 C3 P1：该后台身份是否有进行中恢复（容量淘汰的永不淘汰条件）。
+        // 上下文 state 为 claiming/replaying、有待办定时器，或单例重放状态正为该任务请求/重放中。
+        // 另：单例认领正为该任务进行中（claimState claiming 且目标为当前前台身份）——
+        // 认领只认领前台任务（resume_foreground_task，sendClaimAttempt 取 foregroundTaskIdentity），
+        // 容量检查只发生在移位时（displace 内先调 ensureCapacity、后清前台槽），故此时
+        // foregroundTaskIdentity 仍为被移位任务，即在途认领的目标；上下文 state/timers
+        // 在创建后无人维护（创建点只写 idle/{}），不能作为认领进行中的依据。
+        // 不以令牌非空为条件：首次连接 task_started 先于 register ack 到达时，认领可在无令牌下发出。
+        function backgroundIdentityHasActiveRecovery(rec) {
+            const ctx = backgroundRecoveryContexts[rec.taskId];
+            if (ctx) {
+                if (ctx.state === 'claiming' || ctx.state === 'replaying') return true;
+                if (ctx.timers) {
+                    for (const key in ctx.timers) {
+                        if (ctx.timers[key] !== null && ctx.timers[key] !== undefined) return true;
+                    }
+                }
+            }
+            if (claimState === 'claiming' &&
+                foregroundTaskIdentity && rec.taskId === foregroundTaskIdentity.taskId) return true;
+            if ((replayState === 'requesting' || replayState === 'replaying') &&
+                (rec.taskId === replayTaskId || rec.taskId === currentBackgroundTaskId)) return true;
+            return false;
+        }
+
+        // S7 C3 P1：按级回收一条可回收记录（状态机 §2.5、容量证据 §2.4）。同级内取列表中最先命中的一条
+        // （即最早移入的）；各级按 1→3 顺序尝试，首个有候选的级别回收一条即停，不越级淘汰。
+        // 第 1 级：已解决（terminalAttribution 为 confirmed）且无进行中恢复；
+        // 第 2 级：已到期（now - displacedAt > 6 分钟）且无进行中恢复；
+        // 第 3 级：恢复已终态失败（移入时建过恢复上下文、且上下文已被终态路径清除）且无进行中恢复。
+        // 每条回收记诊断 background_identity_recycled。
+        function recycleOneBackgroundIdentity(level, now) {
+            for (let i = 0; i < backgroundIdentities.length; i++) {
+                const rec = backgroundIdentities[i];
+                if (level === 1) {
+                    if (rec.terminalAttribution !== 'confirmed') continue;
+                } else if (level === 2) {
+                    if (now - rec.displacedAt <= BACKGROUND_IDENTITY_RETENTION_MS) continue;
+                } else {
+                    // 第 3 级可达性修正：原条件 ctx.state 为 'cancelled'/'missing' 在全文件无写入点——
+                    // 上下文唯一创建点只写 state 'idle'，终态路径（onF2Deadline、cancelRecoveryByToken、
+                    // 终态拒绝清理）是删除上下文而不是改写其 state，故原条件恒为假、第 3 级永不可达。
+                    // 改为终态删除信号：移入时建过上下文（hadRecoveryContext）且该上下文现已不在，
+                    // 即恢复曾启动、后走终态路径结束；上下文既已删除，也就无待办定时器可查。
+                    // 从未建过上下文的记录（恢复从未启动，含 found 路径移入的记录）不得走第 3 级，
+                    // 窗口内仍受保护，到期走第 2 级。
+                    if (rec.hadRecoveryContext !== true) continue;
+                    if (backgroundRecoveryContexts[rec.taskId]) continue;
+                }
+                if (backgroundIdentityHasActiveRecovery(rec)) continue;
+                backgroundIdentities.splice(i, 1);
+                perfLog('background_identity_recycled', 'task=' + rec.taskId + ' level=' + level);
+                return true;
+            }
+            return false;
+        }
+
+        // S7 C3 P1：插入新后台记录前腾出容量。按第 1→3 级顺序尝试，首个有候选的级别回收一条即停，
+        // 不越级淘汰；各级均无候选时列表允许超过软上限，新身份正常记入，D-γ 采用照常。
+        // 诊断 background_identity_soft_cap_exceeded 限频：首次记一次，超限持续期间每 60 秒最多一次，回落记一次。
+        function ensureBackgroundIdentityCapacity(now, displacedTaskId) {
+            if (backgroundIdentities.length >= BACKGROUND_IDENTITY_SOFT_CAP) {
+                for (let level = 1; level <= 3; level++) {
+                    if (recycleOneBackgroundIdentity(level, now)) break;
+                }
+            }
+            const count = backgroundIdentities.length + 1;
+            if (count > BACKGROUND_IDENTITY_SOFT_CAP) {
+                if (!backgroundSoftCapExceededActive) {
+                    backgroundSoftCapExceededActive = true;
+                    backgroundSoftCapExceededLoggedAt = now;
+                    perfLog('background_identity_soft_cap_exceeded', 'count=' + count + ' cap=' + BACKGROUND_IDENTITY_SOFT_CAP + ' task=' + displacedTaskId + ' ts=' + now);
+                } else if (now - backgroundSoftCapExceededLoggedAt >= 60000) {
+                    backgroundSoftCapExceededLoggedAt = now;
+                    perfLog('background_identity_soft_cap_exceeded', 'count=' + count + ' cap=' + BACKGROUND_IDENTITY_SOFT_CAP + ' task=' + displacedTaskId + ' ts=' + now);
+                }
+            } else if (backgroundSoftCapExceededActive) {
+                backgroundSoftCapExceededActive = false;
+                perfLog('background_identity_soft_cap_exceeded', 'count=' + count + ' cap=' + BACKGROUND_IDENTITY_SOFT_CAP + ' task=' + displacedTaskId + ' ts=' + now + ' recovered=true');
+            }
+        }
+
+        // S7 C3 P1：前台身份被取代时，先快照（含 terminalAttribution，displacedAt 记取代时刻；
+        // 恢复令牌不在快照内，随身份移入后台上下文）再移入后台列表，顺序不得颠倒；随后才采用新身份。
+        // 前台恢复令牌随身份移入后台上下文，在该上下文内继续有效；前台单例令牌失效，F-2 前台计时停止。
+        function displaceForegroundIdentityToBackground(now) {
+            const old = foregroundTaskIdentity;
+            if (!old) return;
+            ensureBackgroundIdentityCapacity(now, old.taskId);
+            // hadRecoveryContext：移入时是否新建了恢复上下文（与下方建上下文的条件同一判定）。
+            // 供第 3 级逐出区分“恢复曾启动、后终态失败”（上下文已被终态路径清除）与“恢复从未启动”
+            // （窗口内仍受保护）；found 路径移入的记录无此字段，按从未启动处理。
+            const hadRecoveryContext = currentRecoveryToken !== null && !backgroundRecoveryContexts[old.taskId];
+            backgroundIdentities.push({ taskId: old.taskId, backendEpoch: old.backendEpoch, pageId: old.pageId, terminalAttribution: old.terminalAttribution, displacedAt: now, receiptAt: old.receiptAt, hadRecoveryContext: hadRecoveryContext });
+            foregroundTaskIdentity = null;
+            if (hadRecoveryContext) {
+                backgroundRecoveryContexts[old.taskId] = { recoveryToken: currentRecoveryToken, state: 'idle', claimState: null, replayState: null, timers: {} };
+            }
+            if (lastTerminalIdentity && lastTerminalIdentity.taskId === old.taskId && lastTerminalIdentity.backendEpoch === old.backendEpoch) lastTerminalIdentity = null;
+            currentRecoveryToken = null;
+            stopF2Timers();
+        }
+
+        // S7 C3 P1 §5/§8：终态门控分类。返回 kind：
+        // 'undecided' 仅当 msg.data === null（D-5(c)）；'foreground'/'background' 为字段完整匹配；
+        // 'duplicate' 为已 confirmed 记录的重复匹配终态；'discard' 为缺失/不完整/类型错误/空串/未知身份。
+        function gateTerminal(msg) {
+            if (msg.data === null) return { kind: 'undecided' };
+            if (!msg.data || typeof msg.data !== 'object') return { kind: 'discard', reason: 'missing_or_type_error' };
+            const d = msg.data;
+            if (typeof d.taskId !== 'string' || typeof d.backendEpoch !== 'string') return { kind: 'discard', reason: 'missing_or_type_error' };
+            if (!d.taskId || !d.backendEpoch) return { kind: 'discard', reason: 'empty_field_mismatch' };
+            if (foregroundTaskIdentity && d.taskId === foregroundTaskIdentity.taskId && d.backendEpoch === foregroundTaskIdentity.backendEpoch) {
+                if (foregroundTaskIdentity.terminalAttribution === 'confirmed') return { kind: 'duplicate', record: foregroundTaskIdentity };
+                return { kind: 'foreground', record: foregroundTaskIdentity };
+            }
+            for (let i = 0; i < backgroundIdentities.length; i++) {
+                const rec = backgroundIdentities[i];
+                if (d.taskId === rec.taskId && d.backendEpoch === rec.backendEpoch) {
+                    if (rec.terminalAttribution === 'confirmed') return { kind: 'duplicate', record: rec };
+                    return { kind: 'background', record: rec };
+                }
+            }
+            return { kind: 'discard', reason: 'unknown_identity' };
+        }
+
+        // S7 C3 P1 §2.4/§8：前台收据提交。先完成 6 项检查（身份完整性、epoch、归属、消息类型与字段、
+        // 重复/幂等、恢复令牌关联），任一不成立则整个提交不发生；通过后用一次对象替换同步提交
+        // terminalAttribution + receiptAt（单次引用赋值，无可观测的非法中间组合），随后在同一同步段内
+        // 写单例 lastTerminalIdentity（弱一致模型，段内无 await、无重入调用）。
+        // 单例结构 {taskId, backendEpoch, token}，token 取写标记时有效的 currentRecoveryToken（P3 单调整数令牌，
+        // 无恢复进行时为 null）；receivedAt 不作单例字段，receiptAt 只写在身份记录上。
+        function confirmForegroundTerminalReceipt(d, type) {
+            const now = Date.now();
+            const ident = foregroundTaskIdentity;
+            if (!ident) return false;
+            if (typeof d.taskId !== 'string' || !d.taskId || typeof d.backendEpoch !== 'string' || !d.backendEpoch) return false;
+            if (d.backendEpoch !== ident.backendEpoch) return false;
+            if (d.taskId !== ident.taskId) return false;
+            if (type !== 'task_complete' && type !== 'task_stopped') return false;
+            if (ident.terminalAttribution === 'confirmed') return false;
+            if (currentRecoveryToken !== null && (!Number.isInteger(currentRecoveryToken) || currentRecoveryToken <= 0)) return false;
+            const token = currentRecoveryToken;
+            foregroundTaskIdentity = { taskId: ident.taskId, backendEpoch: ident.backendEpoch, pageId: ident.pageId, terminalAttribution: 'confirmed', receiptAt: now };
+            lastTerminalIdentity = { taskId: ident.taskId, backendEpoch: ident.backendEpoch, token: token };
+            return true;
+        }
+
+        // S7 C3 P1 §8：后台记录级收据。只写该记录自身的 terminalAttribution + receiptAt，
+        // 不写单例 lastTerminalIdentity，不终结当前任务，不复活恢复；已 confirmed 不刷新 receiptAt。
+        function confirmBackgroundTerminalReceipt(rec) {
+            const now = Date.now();
+            if (!rec || rec.terminalAttribution === 'confirmed') return false;
+            if (typeof rec.taskId !== 'string' || !rec.taskId || typeof rec.backendEpoch !== 'string' || !rec.backendEpoch) return false;
+            const idx = backgroundIdentities.indexOf(rec);
+            if (idx < 0) return false;
+            backgroundIdentities[idx] = { taskId: rec.taskId, backendEpoch: rec.backendEpoch, pageId: rec.pageId, terminalAttribution: 'confirmed', displacedAt: rec.displacedAt, receiptAt: now, hadRecoveryContext: rec.hadRecoveryContext };
+            return true;
+        }
+
+        // S7 C3 P1 D-5(c)：nil 终态只把当前任务的归属维度置为 undecided，不归因、不终止；
+        // receiptAt 保持为空；已 confirmed 的记录不受 nil 终态改写；无当前身份时不创建任务状态。
+        function markForegroundUndecided() {
+            if (!foregroundTaskIdentity) return false;
+            if (foregroundTaskIdentity.terminalAttribution === 'confirmed') return false;
+            foregroundTaskIdentity = { taskId: foregroundTaskIdentity.taskId, backendEpoch: foregroundTaskIdentity.backendEpoch, pageId: foregroundTaskIdentity.pageId, terminalAttribution: 'undecided', receiptAt: null };
+            return true;
+        }
+
+        // S7 C3 P5/F-2：停全部 F-2 相关定时器（不碰认领/重放定时器，那是 P2–P4 的）。
+        function stopF2Timers() {
+            if (f2DeadlineTimer) { clearTimeout(f2DeadlineTimer); f2DeadlineTimer = null; }
+            if (uiCountdownTimer) { clearInterval(uiCountdownTimer); uiCountdownTimer = null; }
+        }
+
+        // S7 C3 P5/F-2：B 类回调核对三项——令牌仍有效、恢复未终止；代次变化不失效。
+        // 到达时停全部等待定时器、按令牌清理身份、0 次新增请求、转 missing（显式标记见 expiredStreamRowGuard，
+        // 状态机 §2.2/§2.3 missing 表）；不终止后端在途 replayResults（能力 A，设计 B §2）。
+        function onF2Deadline(token) {
+            if (token !== currentRecoveryToken) return;
+            const ident = foregroundTaskIdentity;
+            const bgTaskId = currentBackgroundTaskId;
+            if (!ident && !bgTaskId) return;
+            // S7 C3 P5/F-2（7a）：显式 missing 标记——此后该流的迟到行按零效应丢弃（见 applyResultRow 门控），
+            // 直接发送路径不再为该流发新请求（见 requestReplay 门控）；新流 task_started 采用时清除。
+            expiredStreamRowGuard = { taskId: ident ? ident.taskId : bgTaskId, backendEpoch: initConfigEpoch, reason: 'f2' };
+            stopF2Timers();
+            endRecoveryWait();
+            // S7 C3 P4 (l3)/P6 §2.3 missing 表：F-2 到达时取消认领与重放全部等待定时器；
+            // 账本活记录 → expired（墓碑保留），本流 replay_results 队列项删除；
+            // replayLastSeq 清零、缓冲清空、当前请求身份清零、计数作废、耗尽标志清除。
+            // 高水位按流切换重置，此处不另行清零（F-2 是“作废”，不用“清零”措辞）。
+            stopClaimTimers();
+            claimState = 'idle';
+            if (replayWaitTimer) { clearTimeout(replayWaitTimer); replayWaitTimer = null; }
+            if (replayGapTimer) { clearTimeout(replayGapTimer); replayGapTimer = null; }
+            currentReplayRequestId = null;
+            replaySilentRetryCount = 0;
+            replayExhausted = false;
+            replayTailGap = false;
+            for (const rec of replayLedger.values()) {
+                if (rec.state === 'inflight' || rec.state === 'queued') rec.state = 'expired';
+            }
+            pruneReplayLedger();
+            if (pendingBusinessQueue.length > 0) {
+                const keptQueue = [];
+                for (const entry of pendingBusinessQueue) {
+                    const p = entry.payload;
+                    const dd = (p && p.data && typeof p.data === 'object') ? p.data : {};
+                    if (p && p.type === 'replay_results' && dd.backendEpoch && dd.backendEpoch === initConfigEpoch) continue;
+                    keptQueue.push(entry);
+                }
+                pendingBusinessQueue = keptQueue;
+            }
+            replayLastSeq = 0;
+            replayPending.clear();
+            replayTaskId = '';
+            replayThroughSeq = 0;
+            replayCompleteReceived = false;
+            replayState = 'idle';
+            if (ident && backgroundRecoveryContexts[ident.taskId]) delete backgroundRecoveryContexts[ident.taskId];
+            if (ident) foregroundTaskIdentity = null;
+            if (bgTaskId && backgroundRecoveryContexts[bgTaskId]) delete backgroundRecoveryContexts[bgTaskId];
+            if (bgTaskId) currentBackgroundTaskId = '';
+            currentRecoveryToken = null;
+            f2DeadlineTimestamp = null;
+            // S7 C3 P5/F-2（7a）：UI 清理——关闭等待重连确认卡（其“立即取消”在令牌失效后已为 no-op，
+            // 文案“正在等待重连”已过期；仅当当前显示的正是该卡时关闭，以标题 '等待重连' 识别，
+            // 不碰用户此间打开的其他确认卡）；状态栏与开始按钮随下行回到可开始新任务（§2.1 missing）。
+            const __mask = (typeof document !== 'undefined' && document.getElementById) ? document.getElementById('noticeCardMask') : null;
+            const __title = (typeof document !== 'undefined' && document.getElementById) ? document.getElementById('noticeCardTitle') : null;
+            if (__mask && __mask.classList && __mask.classList.contains('active') && __title && __title.textContent === '等待重连') closeNoticeCard();
+            if (isTaskRunning || backgroundTaskActive) finishRunningTask('✨ 开始扫描与测试');
+            updateStatus('恢复超时，任务已不可恢复', false);
+            log('恢复等待已超过 120 秒，任务按不可恢复处理');
+            perfLog('f2_deadline_reached', 'task=' + (ident ? ident.taskId : bgTaskId));
+        }
+
+        // S7 C3 P5：断线时创建恢复令牌（仅当无有效令牌）并启动 F-2；同一任务第二次断线不创建新令牌、不重算截止。
+        // 新恢复令牌创建时清除单例终态收据（防跨轮次陈旧，状态机 §8）。
+        function ensureRecoveryTokenOnDisconnect() {
+            if (currentRecoveryToken !== null && currentRecoveryToken !== undefined) return false;
+            recoveryTokenCounter += 1;
+            currentRecoveryToken = recoveryTokenCounter;
+            lastTerminalIdentity = null;
+            const now = Date.now();
+            f2DeadlineTimestamp = now + 120000;
+            if (f2DeadlineTimer) { clearTimeout(f2DeadlineTimer); f2DeadlineTimer = null; }
+            const token = currentRecoveryToken;
+            f2DeadlineTimer = setTimeout(function () { onF2Deadline(token); }, 120000);
+            return true;
+        }
+
+        // S7 C3 P6 §5(d)：进入“等待重连”UI——状态栏显示 F-2 剩余倒计时，确认卡片提供“立即取消”。
+        // 已连接时显示“恢复等待中”，未连接时显示“等待重连”；倒计时只显示，不执行硬截止。
+        function showWaitingReconnectUI() {
+            if (f2DeadlineTimestamp === null || f2DeadlineTimestamp === undefined) return;
+            const updateCountdown = function () {
+                const remainMs = f2DeadlineTimestamp - Date.now();
+                if (remainMs <= 0) return;
+                const connected = !!(ws && ws.readyState === WebSocket.OPEN);
+                updateStatus(connected ? ('恢复等待中，F-2 剩余 ' + Math.ceil(remainMs / 1000) + ' 秒') : ('连接断开，等待重连… F-2 剩余 ' + Math.ceil(remainMs / 1000) + ' 秒'), false);
+            };
+            updateCountdown();
+            if (uiCountdownTimer) { clearInterval(uiCountdownTimer); uiCountdownTimer = null; }
+            uiCountdownTimer = setInterval(function () {
+                if (currentRecoveryToken === null || currentRecoveryToken === undefined) {
+                    if (uiCountdownTimer) { clearInterval(uiCountdownTimer); uiCountdownTimer = null; }
+                    return;
+                }
+                updateCountdown();
+            }, 1000);
+            const token = currentRecoveryToken;
+            showConfirmCard('连接已断开，正在等待重连（F-2 剩余约 120 秒）。\n点「确认」立即取消本次恢复（按令牌核对后清理）；点「取消」仅关闭本提示，继续等待重连。', function () { cancelRecoveryByToken(token); }, '等待重连');
+        }
+
+        // S7 C3 P6：用户“立即取消”——按令牌核对后清理；令牌不匹配（已有新恢复/新任务）时 no-op。
+        // 7b 定性：本路径是“用户明确取消恢复”（状态机 §2.3 清理触发器 4；P6 §1“用户取消”），
+        // 不是停止表新表 3 的 stop_task——§2.3“身份的范围”将“用户明确取消恢复”列为
+        // currentBackgroundTaskId 保留的终点，故此处清理该字段正确；新表 3 的“保留”只约束 stop_task 路径
+        //（resetStoppedTaskUI / task_stopped 确认分支均不碰该字段），两者不冲突，本函数行为不动。
+        function cancelRecoveryByToken(token) {
+            if (token === null || token === undefined || token !== currentRecoveryToken) return;
+            const ident = foregroundTaskIdentity;
+            const bgTaskId = currentBackgroundTaskId;
+            stopF2Timers();
+            endRecoveryWait();
+            // S7 C3 P6：用户取消恢复——停认领与重放等待计时器，当前请求身份清零，
+            // 账本在途 → expired，计数/耗尽/尾部缺口清零；显示数据与水位/缓冲保留（非 missing/epoch 清理）。
+            stopClaimTimers();
+            claimState = 'idle';
+            if (replayWaitTimer) { clearTimeout(replayWaitTimer); replayWaitTimer = null; }
+            if (replayGapTimer) { clearTimeout(replayGapTimer); replayGapTimer = null; }
+            currentReplayRequestId = null;
+            replaySilentRetryCount = 0;
+            replayExhausted = false;
+            replayTailGap = false;
+            for (const rec of replayLedger.values()) {
+                if (rec.state === 'inflight') rec.state = 'expired';
+            }
+            pruneReplayLedger();
+            if (ident && backgroundRecoveryContexts[ident.taskId]) delete backgroundRecoveryContexts[ident.taskId];
+            if (ident) foregroundTaskIdentity = null;
+            if (bgTaskId && backgroundRecoveryContexts[bgTaskId]) delete backgroundRecoveryContexts[bgTaskId];
+            if (bgTaskId) currentBackgroundTaskId = '';
+            currentRecoveryToken = null;
+            f2DeadlineTimestamp = null;
+            if (isTaskRunning || backgroundTaskActive) finishRunningTask('✨ 开始扫描与测试');
+            updateStatus('已取消恢复', false);
+            log('已取消恢复等待');
+            perfLog('recovery_cancelled_by_user', 'task=' + (ident ? ident.taskId : bgTaskId));
+        }
+
+        // S7 C3 M-5（状态机 §2.2/§3.6，第四十轮）：epoch 变化逐字段处置——旧身份整体作废、不重试；
+        // 新流恢复 → idle；计时器取消；令牌失效。账本（replayLedger 等）与 flush 四门检查属 P4，
+        // 已在本文件落地（见 resetReplayState、flushBusinessQueue），下方 (m5) 段即其作废处置；
+        // 业务队列仍由既有 ack 时 purge + init_config 回填处理。
+        function disposeEpochIdentities() {
+            // S7 C3 P4 M-5（状态机 §2.3 epoch 表；设计 B §D 行隔离）：epoch 变化前先捕获旧流身份，
+            // 置迟到行隔离标记——此后旧流的迟到行/旧请求响应按零效应丢弃（见 applyResultRow 门控与
+            // requestReplay 门控），直至新流 task_started 采用时清除；标记只含旧流 taskId/epoch，
+            // 不触碰新流的任何状态（新 epoch 的记录/墓碑/高水位均不在本函数清理之列）。
+            // 注意调用时序：init_config 内本函数在 initConfigEpoch 更新前调用，backend_restarted 内
+            // 新 epoch 尚未到达，故此处 initConfigEpoch 仍是旧 epoch，下列按旧 epoch 匹配的清理均正确。
+            const oldEpochTask = (foregroundTaskIdentity && foregroundTaskIdentity.taskId) || currentBackgroundTaskId || replayTaskId;
+            const oldEpoch = initConfigEpoch;
+            if (oldEpochTask || oldEpoch) expiredStreamRowGuard = { taskId: oldEpochTask || '', backendEpoch: oldEpoch || '', reason: 'epoch' };
+            foregroundTaskIdentity = null;
+            backgroundIdentities = [];
+            backgroundRecoveryContexts = {};
+            lastTerminalIdentity = null;
+            currentRecoveryToken = null;
+            f2DeadlineTimestamp = null;
+            stopF2Timers();
+            endRecoveryWait();
+            currentBackgroundTaskId = '';
+            // S7 C3 P4 (m5)：epoch 变化作废处置——账本旧流活记录 → expired(stream-end)，
+            // 旧流墓碑丢弃，当前请求身份清零，等待计时器取消；随后 resetReplayState(true)
+            // 执行流切换清理（(m6) 活记录清空、高水位与尾部缺口标志重置）。
+            if (replayWaitTimer) { clearTimeout(replayWaitTimer); replayWaitTimer = null; }
+            currentReplayRequestId = null;
+            for (const rec of replayLedger.values()) {
+                if (rec.backendEpoch === initConfigEpoch && (rec.state === 'inflight' || rec.state === 'queued')) rec.state = 'expired';
+            }
+            for (const [key, t] of Array.from(replayTombstones.entries())) {
+                if (t.backendEpoch === initConfigEpoch) replayTombstones.delete(key);
+            }
+            resetReplayState(true);
+            if (isTaskRunning || backgroundTaskActive) finishRunningTask('✨ 开始扫描与测试');
+        }
+
+        // 记录后端任务 ID（建立或确认当前任务身份）。
+        // 仅由三条明确路径调用：恢复期的 found、转入后台的 enabled、
+        // 对跟随请求的 following 回复。update 永远不调用本函数建立身份，
+        // 带不同 ID 的 update 一律丢弃。
+        // 重连恢复时若找到的任务与记录的不同，旧身份移入后台列表保留，
+        // 数据按恢复决议处理；采用新身份时不得清除旧身份记录或旧数据（S7 C3 P1）。
+        // 快照无 taskId（旧后端）时不建立身份，直接应用。
+        function noteBackgroundTaskId(snapshot, isRecoveryFound) {
+            const incomingId = (snapshot && snapshot.taskId) || '';
+            if (!incomingId) return;
+            const oldId = currentBackgroundTaskId;
+            if (isRecoveryFound && oldId && incomingId !== oldId) {
+                const now = Date.now();
+                if (foregroundTaskIdentity && foregroundTaskIdentity.taskId === oldId) {
+                    displaceForegroundIdentityToBackground(now);
+                    // S7 C3 P1/P2（第二轮第 1 项）：found 任务不是前台任务——前台身份只由
+                    // task_started 建立（state-machine §2.1 running 行、implementation-plan P1 §1），
+                    // found 只确认后台任务（保留旧数据 + requestReplay('found')，state-machine §2 现状三路），
+                    // 故此处不采用 T3 为前台、不为 T3 认领；同时取消已在途的旧前台认领——
+                    // 被移位身份的认领已无前台可归属（resume_accepted 遇前台为空即丢弃，
+                    // resume_rejected 遇 claimState 非 claiming 即丢弃），且认领在途会
+                    // 挡住随后 requestReplay('found')（requestReplay 遇 claiming 即拒），
+                    // 不取消将使认领空转、重放永不开始。只取消，不重发、不改认领目标。
+                    if (claimState === 'claiming') {
+                        stopClaimTimers();
+                        claimState = 'idle';
+                        perfLog('ws_claim_cancelled_by_found', 'old=' + oldId + ' found=' + incomingId);
+                    }
+                } else {
+                    ensureBackgroundIdentityCapacity(now, oldId);
+                    backgroundIdentities.push({ taskId: oldId, backendEpoch: initConfigEpoch, pageId: pageId, terminalAttribution: 'pending', displacedAt: now, receiptAt: null });
+                }
+                log('后台任务已变更（' + oldId + ' → ' + incomingId + '），旧身份已移入后台记录');
+            }
+            currentBackgroundTaskId = incomingId;
+            // 任务身份切换（旧身份非空且不同）：待处理跟随请求的目标若已不是当前任务，
+            // 清除旧请求状态，否则后续合法的 following（新任务）会被旧请求的预期 taskId 挡掉。
+            // 只在真正切换时清理，同一任务重复记录不清理；无目标的请求（发出时未知任务 ID）不清理。
+            // 清除 pending 不会让旧任务的迟到 following 被接受：无请求时到达的 following
+            // 仍须与当前身份一致才应用（见 following 分支的无请求校验）。
+            if (oldId && oldId !== incomingId && followRequestPending && followRequestTaskId && followRequestTaskId !== incomingId) {
+                const staleTarget = followRequestTaskId;
+                followRequestPending = false;
+                followRequestTaskId = '';
+                perfLog('ws_follow_request_cleared', 'stale_target=' + staleTarget + ' new=' + incomingId);
+            }
+        }
+
         function connect() {
+            // 第四阶段 B 批次 R3：注册连续被拒 3 次后停止重连（见设计 v22.2 §1.7）。
+            if (registerRejectedStop) return;
+            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+            // 第四阶段 A 批次：创建新连接前先处理旧连接——解除回调并关闭，
+            // 避免旧回调干扰新连接；随后递增代次。
+            closeCurrentSocket();
+            stopHeartbeat();
+            perfConnSeq += 1;
+            const gen = perfConnSeq;
+            // S7 C3 P3 (f)：代次递增时取消旧认领重试/轮询定时器并清零计数（F-2 不重置）。
+            resetClaimForNewGeneration();
+            // 新连接先清空旧连接的后端 connectionId，init_config 到达前日志用 js-ws-N，不沿用上一次的 ws-N。
+            perfConnId = '';
+            perfLog('ws_connect', 'gen=' + gen);
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
             const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(wsProtocol + "//" + window.location.host + "/ws");
+            const socket = ws;
             ws.onopen = () => {
+                if (gen !== perfConnSeq) { try { socket.close(); } catch (e) {} return; }
+                perfLog('ws_open', 'has_connected_before=' + hasConnectedBefore);
+                reconnecting = false;
+                // 第四阶段 B 批次 R3：每连接重置注册状态、epoch 与暂存信号（见设计 v22.2 §1.4）。
+                // 未决的恢复查询属于旧连接，随连接作废；恢复等待（S1）仍按原有逻辑在下方开始。
+                pageRegistered = false;
+                initConfigReceived = false;
+                initConfigEpoch = '';
+                registerPageSent = false;
+                pendingConnectTimeSignal = null;
+                clearPendingRecovery();
+                // 成功建立连接，重置退避计数。
+                reconnectAttempt = 0;
+                if (hasConnectedBefore) {
+                    // 第四阶段 B 批次：重连成功不再立即清空数据，先等待后端恢复状态。
+                    // 找到后台任务则保留旧数据；确认无任务（missing）或超时兜底才清空。
+                    // 旧会话的扫描 IP 仍不可直接用于新会话的详细测试，但数据本身先保留，
+                    // 待恢复结果决定去留，不在信号到达前用空数据覆盖。
+                    recoveryPending = true;
+                    recoveryGen = gen;
+                    // 记录本次等待对应的旧任务身份与旧数据代次，供超时/missing 校验。
+                    recoveryDataGen = dataGen;
+                    recoveryTaskId = currentBackgroundTaskId;
+                    if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+                    recoveryTimer = setTimeout(() => {
+                        if (!recoveryPending || recoveryGen !== gen) return;
+                        perfLog('ws_recovery_resolved', 'result=timeout gen=' + gen);
+                        // 仅当等待仍针对旧任务、旧数据时才按 missing 处理；
+                        // 等待期间已有新任务或新数据时，只结束等待，不得结束/清空新任务。
+                        if (recoveryStillTargetsOldTask()) {
+                            clearRecoveredData();
+                            // 超时确认旧任务不可恢复：先清除后台任务身份与运行标志，
+                            // 再结束任务 UI。finishRunningTask 会为 backgroundTaskActive
+                            // 保留卡片与身份（后台任务完成时的设计），因此必须先清，
+                            // 否则残留旧任务 ID 与 active 卡片；与 missing 分支的清理顺序一致。
+                            currentBackgroundTaskId = '';
+                            backgroundTaskActive = false;
+                            backgroundTaskFollowing = false;
+                            stopBackgroundStatusPolling();
+                            finishRunningTask('✨ 开始扫描与测试');
+                            log('未收到后端恢复状态，已清空旧会话数据');
+                        } else {
+                            log('恢复等待超时，但已有新任务或新数据，保留当前任务状态');
+                        }
+                        endRecoveryWait();
+                    }, RECOVERY_WAIT_TIMEOUT_MS);
+                    log('连接已恢复，正在等待后端恢复状态…');
+                }
+                hasConnectedBefore = true;
                 updateStatus('已连接服务器', true);
                 log('已连接服务器');
                 initThemeFromStorage();
+                // 第四阶段 B 批次 R3：心跳启动点移至 register_page_ack 处理函数
+                // （注册确认后）；此处只尝试注册——init_config 未到时为空操作，
+                // 覆盖 init_config 在 onopen 触发前已到达的情况。
+                tryRegisterPage();
             };
             ws.onmessage = (event) => {
+                if (gen !== perfConnSeq) return;
                 try {
                     const msg = JSON.parse(event.data);
                     handleMessage(msg);
@@ -3123,19 +4893,91 @@
                     console.error('WebSocket message parse error:', e);
                 }
             };
+            ws.onerror = () => {
+                // 错误只记录，不单独安排重连；浏览器随后会触发 onclose，由 onclose 走统一重连流程。
+                if (gen !== perfConnSeq) return;
+                perfLog('ws_error', 'gen=' + gen);
+            };
             ws.onclose = () => {
+                if (gen !== perfConnSeq) return;
+                perfLog('ws_close', 'has_connected_before=' + hasConnectedBefore);
+                stopHeartbeat();
+                // 第四阶段 B 批次：连接断开，本次连接的恢复等待随之作废；
+                // 下一次连接成功后会重新开始等待。未收到回复的跟随请求一并作废。
+                endRecoveryWait();
+                followRequestPending = false;
+                followRequestTaskId = '';
+                // 第四阶段 B 批次 R3：连接断开，注册失效；未决恢复查询与重查定时器作废；
+                // 本连接在 init_config 前入队且 epoch 未知的消息无法判断代次，全部丢弃。
+                pageRegistered = false;
+                clearPendingRecovery();
+                purgeEpochUnknownQueue(gen);
+                // S7 C3 P3/P4：断线时代次作废——取消认领定时器并清零计数（F-2 不重置），
+                // 取消重放等待/缺口计时器、当前请求身份 → null、账本 inflight → expired(disconnect)，
+                // 删除本流 replay_results 队列项；缓冲、水位、计数、耗尽标志、高水位保留（M-9）。
+                resetClaimForNewGeneration();
+                if (replayWaitTimer) { clearTimeout(replayWaitTimer); replayWaitTimer = null; }
+                if (replayGapTimer) { clearTimeout(replayGapTimer); replayGapTimer = null; }
+                currentReplayRequestId = null;
+                replayTailGap = false;
+                for (const rec of replayLedger.values()) {
+                    if (rec.state === 'inflight') rec.state = 'expired';
+                }
+                pruneReplayLedger();
+                if (pendingBusinessQueue.length > 0) {
+                    const keptQueue = [];
+                    const droppedQueue = [];
+                    for (const entry of pendingBusinessQueue) {
+                        const p = entry.payload;
+                        const dd = (p && p.data && typeof p.data === 'object') ? p.data : {};
+                        if (p && p.type === 'replay_results' && dd.backendEpoch && dd.backendEpoch === initConfigEpoch) { droppedQueue.push(entry); continue; }
+                        keptQueue.push(entry);
+                    }
+                    pendingBusinessQueue = keptQueue;
+                    for (let i = 0; i < droppedQueue.length; i++) terminateQueuedReplayRecord(droppedQueue[i], 'queue-dropped');
+                }
                 clearStopWatchdog();
                 resetCurrentSpeedButton();
                 if (backgroundTaskActive) {
                     log('连接断开，后台任务将继续运行');
-                } else if (isTaskRunning || officialBatchSpeedRunning || isStoppingTask) {
-                    resetStoppedTaskUI('连接断开，当前任务状态已重置');
                 }
-                updateStatus('连接断开，3秒后重连...', false);
+                // S7 C3 P5/P6：断线不再立即 resetStoppedTaskUI，改为等待重连 UI。
+                // 仅当有可恢复任务（前台身份/后台任务/运行中任务）时创建恢复令牌并启动 F-2；
+                // 无任务时不创建令牌，只走统一重连流程。
+                if (foregroundTaskIdentity || currentBackgroundTaskId || isTaskRunning || backgroundTaskActive || officialBatchSpeedRunning || isStoppingTask) {
+                    ensureRecoveryTokenOnDisconnect();
+                    showWaitingReconnectUI();
+                }
+                updateStatus('连接断开，正在重连...', false);
                 log('连接断开，正在重连...');
-                setTimeout(connect, 3000);
+                scheduleReconnect(gen);
             };
         }
+
+        // iOS 从后台恢复时立即重连，不等待后台期间被节流的 3 秒定时器。
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') {
+                // 进入后台：停止心跳（避免定时器节流误判），清掉待处理的重连定时器，
+                // 不安排重连；回前台时 visibilitychange 会立即尝试。
+                stopHeartbeat();
+                if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+                reconnecting = false;
+                return;
+            }
+            perfLog('ws_visibility_visible', '');
+            if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            // 不主动关闭仍处于 OPEN/CONNECTING 的连接，否则会无故创建新后端会话，
+            // 使原会话的扫描 IP 失效。已关闭或正在关闭时才立即重连。
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                // 仍 OPEN 时不能只凭 readyState 判断健康：半开连接看似正常，
+                // 立即用一次心跳验证，确认超时再走统一重连流程。
+                if (ws.readyState === WebSocket.OPEN) startHeartbeat(perfConnSeq);
+                return;
+            }
+            reconnecting = false;
+            ws = null;
+            connect();
+        });
 
         function updateStatus(text, connected) {
             statusEl.textContent = text;
@@ -3202,10 +5044,14 @@
             if (proxyCountryCheckPending) return true;
             proxyWarningPendingAction = action;
             proxyCountryCheckPending = true;
+            // 第三阶段修正：用户主动检查开始，代次递增，旧的初始化结果即失效。
+            proxyCountryCheckSeq += 1;
             if (proxyCountryCheckTimer) window.clearTimeout(proxyCountryCheckTimer);
             proxyCountryCheckTimer = window.setTimeout(() => {
                 proxyCountryCheckPending = false;
                 proxyCountryCheckTimer = null;
+                // 第三阶段修正：超时也是一次检查完成，代次递增，旧的初始化结果不得覆盖超时状态。
+                proxyCountryCheckSeq += 1;
                 cfCountry = '检测失败';
                 proxyGeoCheckOK = false;
                 proxyWarningRequired = true;
@@ -3222,7 +5068,34 @@
             return true;
         }
 
+        // 第三阶段修正：应用 init_config 的地区状态。用户主动地区检查进行中时跳过，
+        // 不得覆盖检查尚未完成的状态；待检查结果（或超时）到达后再由其更新。
+        function applyInitGeoState(data) {
+            if (proxyCountryCheckPending) return;
+            cfCountry = normalizeProxyCountry(data || {});
+            proxyWarningRequired = !!data?.proxyWarning;
+            proxyGeoCheckOK = data?.geoCheckOK !== false;
+        }
+
         function handleProxyCountryResult(data) {
+            // 第三阶段：初始化异步探测结果（source=init）只更新地区状态，
+            // 不触碰用户主动触发的地区检查：不清除待处理操作与超时定时器，
+            // 不弹警告框，不设置单次放行，避免与用户主动检查互相干扰。
+            if (data && data.source === 'init') {
+                // 第三阶段修正：代次保护。用户主动检查进行中，或开始/完成/超时后，
+                // 旧的初始化结果一律丢弃，不得覆盖用户主动检查的状态。
+                if (proxyCountryCheckPending || proxyCountryCheckSeq !== proxyCountryInitSeq) {
+                    perfLog('ws_proxy_country_result', 'source=init dropped stale');
+                    return;
+                }
+                cfCountry = normalizeProxyCountry(data);
+                proxyWarningRequired = !!data?.proxyWarning;
+                proxyGeoCheckOK = data?.geoCheckOK !== false;
+                if (proxyWarningRequired) log(`代理检测警告：当前网络标签 ${cfCountry}`);
+                return;
+            }
+            // 第三阶段修正：用户主动检查完成，代次递增，此后到达的旧初始化结果即失效。
+            proxyCountryCheckSeq += 1;
             cfCountry = normalizeProxyCountry(data);
             proxyWarningRequired = !!data?.proxyWarning;
             proxyGeoCheckOK = data?.geoCheckOK !== false;
@@ -3522,10 +5395,19 @@
 
         function confirmRunTaskInBackground() {
             if (!isTaskRunning) return;
-            if (!wsSend({ type: 'run_in_background', data: {} })) {
+            // 第四阶段 B 批次 R3：发布意图（见设计 v22.2 §1.6/§10.2）。
+            // publishId 在点击时生成（pub-<pageId>-<counter>，页面级单调递增），
+            // 意图在 wsSend 返回 true（已发出）或 'queued'（已入队）时记录；
+            // 发送失败（false）时不记录。意图记录独立于命令队列：
+            // 命令被 purge 丢弃时意图仍保留，由恢复查询决议终态（见 §10.6）。
+            publishCounter += 1;
+            const publishId = 'pub-' + pageId + '-' + publishCounter;
+            const sendResult = wsSend({ type: 'run_in_background', data: { publishId: publishId, pageId: pageId } });
+            if (!sendResult) {
                 showNoticeCard('连接未就绪，请等待重连后再试');
                 return;
             }
+            pendingPublishIntents[publishId] = { publishId: publishId, pageId: pageId, createdAt: Date.now() };
             hideBackgroundConfirmCard();
             updateBackgroundButton();
         }
@@ -3545,6 +5427,11 @@
                 showNoticeCard('连接未就绪，请等待重连后再试');
                 return;
             }
+            // 标记正在等 following 回复，并记录本次请求对应的任务 ID：
+            // 到达的 following 只有是本次请求的回复、且与请求目标一致才算新鲜。
+            // 发送失败时不设置（上面已返回），请求状态保持未发出。
+            followRequestPending = true;
+            followRequestTaskId = currentBackgroundTaskId;
         }
 
         function startBackgroundStatusPolling() {
@@ -3716,6 +5603,9 @@
             const wasBackgroundTask = backgroundTaskActive;
             isTaskRunning = false;
             isStoppingTask = false;
+            // 任务已结束，未收到回复的跟随请求一并作废（其目标任务已不存在）。
+            followRequestPending = false;
+            followRequestTaskId = '';
             if (!wasBackgroundTask) {
                 backgroundTaskActive = false;
             }
@@ -3938,6 +5828,8 @@
                 resetProgress();
                 progressBox.style.display = 'block';
                 updateNSBSpeedButtons();
+                // S6：新任务开始，重置序号状态与三组状态（后端新任务建新日志，序号从 1 开始）。
+                resetReplayState(true); // S7 C3 P4 (n11.2)/(n12.5)：流切换调用点，重置高水位与尾部缺口标志
                 if (!wsSend({ type: 'start_nsb_reallink', data: {
                     results: rows,
                     relinkHost: probeHost,
@@ -4437,6 +6329,7 @@
         function addScanResult(row, render = true) {
             scanResultsCount++;
             scanData.push(row);
+            bumpDataGen();
             updateBadge('scanCount', getFilteredOfficialScanData().length);
             if (render) renderScanRowOfficial(row);
         }
@@ -4500,6 +6393,9 @@
             autoUploadKeys = new Set();
             updateBadge('testCount', 0);
             testData = [];
+            // S6：新任务开始，重置序号状态与三组状态（后端新任务建新日志，序号从 1 开始）。
+            resetReplayState(true); // S7 C3 P4 (n11.2)/(n12.5)：流切换调用点，重置高水位与尾部缺口标志
+            bumpDataGen();
             officialSpeedEnabledForResults = false;
             officialContinueSpeedUnlocked = false;
             setOfficialTestQualifiedFilter('all');
@@ -4544,6 +6440,7 @@
         function addTestResult(res, render = true) {
             testResultsCount++;
             testData.push(res);
+            bumpDataGen();
             updateBadge('testCount', getFilteredOfficialTestData().length);
             if (render && matchesOfficialQualifiedFilter(res, officialTestQualifiedFilter)) renderTestRow(res);
             updateBatchSpeedButton();
@@ -4603,6 +6500,8 @@
             currentSpeedTestingIP = ip;
             const port = parseInt(document.getElementById('officialTestPort').value);
             const customUrl = resolveSpeedTestUrl('officialSpeedUrl', 'officialSpeedUrlPreset');
+            // S6：新任务开始，重置序号状态与三组状态（后端新任务建新日志，序号从 1 开始）。
+            resetReplayState(true); // S7 C3 P4 (n11.2)/(n12.5)：流切换调用点，重置高水位与尾部缺口标志
             if (!wsSend({ type: 'start_speed_test', data: { ip, port, url: customUrl } })) {
                 if (speedVal) speedVal.textContent = '连接未就绪';
                 if (btn) {
@@ -4715,6 +6614,8 @@
             resetProgress();
             progressBox.style.display = 'block';
             updateBatchSpeedButton();
+            // S6：新任务开始，重置序号状态与三组状态（后端新任务建新日志，序号从 1 开始）。
+            resetReplayState(true); // S7 C3 P4 (n11.2)/(n12.5)：流切换调用点，重置高水位与尾部缺口标志
             if (!wsSend({ type: 'start_official_speed_batch', data: { ...cfg, skipTested: continued } })) {
                 officialBatchSpeedRunning = false;
                 finishRunningTask('✨ 开始扫描与测试');
@@ -4767,6 +6668,8 @@
             resetProgress();
             progressBox.style.display = 'block';
             updateNSBSpeedButtons();
+            // S6：新任务开始，重置序号状态与三组状态（后端新任务建新日志，序号从 1 开始）。
+            resetReplayState(true); // S7 C3 P4 (n11.2)/(n12.5)：流切换调用点，重置高水位与尾部缺口标志
             if (!wsSend({ type: 'start_nsb_speed_batch', data: { results: rows, speedTest: cfg.speedTest, speedURL: cfg.speedURL, enableTLS: cfg.enableTLS, speedMin: cfg.speedMin, speedLimit: cfg.speedLimit, skipTested: continued, compact: nsbCompactView } })) {
                 nsbBatchSpeedRunning = false;
                 finishRunningTask('✨ 开始扫描与测试');
@@ -4845,9 +6748,44 @@
             }
         }
 
+        // S7 C3 P6 §5(a)：恢复未决判定——重连等待中 / 恢复等待中 / 认领中 / 重放中任一成立即为未决。
+        function isRecoveryPending() {
+            if (reconnecting || recoveryPending) return true;
+            if (claimState === 'claiming') return true;
+            if (replayState === 'requesting' || replayState === 'replaying') return true;
+            return false;
+        }
+
+        // S7 C3 P6 §5(a)：守卫取消入口。有令牌时按令牌核对后清理（cancelRecoveryByToken 内含令牌核对）；
+        // 无令牌的后台重放（found/following 路径）仅停重放等待并结束恢复等待，后台任务本身不受影响。
+        function cancelPendingRecoveryForNewTask() {
+            if (currentRecoveryToken !== null && currentRecoveryToken !== undefined) {
+                cancelRecoveryByToken(currentRecoveryToken);
+                return;
+            }
+            stopClaimTimers();
+            claimState = 'idle';
+            if (replayWaitTimer) { clearTimeout(replayWaitTimer); replayWaitTimer = null; }
+            if (replayGapTimer) { clearTimeout(replayGapTimer); replayGapTimer = null; }
+            currentReplayRequestId = null;
+            replaySilentRetryCount = 0;
+            replayExhausted = false;
+            replayTailGap = false;
+            endRecoveryWait();
+            updateStatus('已取消恢复', false);
+            log('已取消恢复等待');
+        }
+
         function startTask() {
             if (isTaskRunning || officialBatchSpeedRunning || nsbBatchSpeedRunning) {
                 showConfirmCard(getStopConfirmText(), confirmStopCurrentTask, '终止当前任务');
+                return;
+            }
+
+            // S7 C3 P6 §5(a)：恢复未决守卫——拦截新任务，不发送 start_task，不调用 resetReplayState()；
+            // UI 提示旧任务恢复中并提供取消入口。
+            if (isRecoveryPending()) {
+                showConfirmCard('旧任务正在恢复中（重连/认领/重放未完成），请等待恢复完成后再开始新任务。\n点「确认」取消本次恢复；点「取消」仅关闭本提示，继续等待恢复。', function () { cancelPendingRecoveryForNewTask(); }, '恢复未完成');
                 return;
             }
 
@@ -4872,6 +6810,11 @@
         }
 
         function startOfficialTask() {
+            // S7 C3 P6 §5(a)：恢复未决守卫（与 startTask 入口同一规则；直接调用本函数时同样拦截）。
+            if (isRecoveryPending()) {
+                showConfirmCard('旧任务正在恢复中（重连/认领/重放未完成），请等待恢复完成后再开始新任务。\n点「确认」取消本次恢复；点「取消」仅关闭本提示，继续等待恢复。', function () { cancelPendingRecoveryForNewTask(); }, '恢复未完成');
+                return;
+            }
             const ipType = parseInt(document.getElementById('officialIpType').value);
             const threads = parseInt(document.getElementById('officialThreads').value) || 100;
             const port = parseInt(document.getElementById('officialTestPort').value) || 443;
@@ -4907,6 +6850,9 @@
             scanData = [];
             testData = [];
             dcList = [];
+            // S6：新任务开始，重置序号状态与三组状态（后端新任务建新日志，序号从 1 开始）。
+            resetReplayState(true); // S7 C3 P4 (n11.2)/(n12.5)：流切换调用点，重置高水位与尾部缺口标志
+            bumpDataGen();
             testedDCs.clear();
             currentTestingDC = '';
             scanResultsCount = 0;
@@ -5021,6 +6967,8 @@
             nsbLiveRows = [];
             nsbLiveIndex = {};
             nsbLiveRowElements = {};
+            // S6：新任务开始，重置序号状态与三组状态（后端新任务建新日志，序号从 1 开始）。
+            resetReplayState(true); // S7 C3 P4 (n11.2)/(n12.5)：流切换调用点，重置高水位与尾部缺口标志
             updateBadge('scanCount', 0);
             autoUploadKeys = new Set();
 
@@ -6281,24 +8229,418 @@
         function handleMessage(msg) {
             switch (msg.type) {
                 case 'init_config':
+                    // 第四阶段 B 批次 R3：epoch 是注册的前提（见设计 v22.2 §1.4/§10.5）。
+                    // 后端未带 epoch 时无法注册：关闭本连接并重连（防御性分支；
+                    // 正常后端一定携带 backendEpoch，见 §10.1）。
+                    const newEpoch = (msg.data && msg.data.backendEpoch) || '';
+                    if (!newEpoch) {
+                        perfLog('ws_init_config_no_epoch', 'conn=' + perfConnId);
+                        log('后端未提供 epoch，无法注册，正在重连…');
+                        if (ws) { try { ws.close(); } catch (e) {} }
+                        break;
+                    }
+                    // 第一阶段仅记录后端分配的连接标识，不据此改变任何行为。
+                    if (msg.data && msg.data.connectionId) perfConnId = msg.data.connectionId;
+                    perfLog('ws_init_config', 'conn=' + perfConnId);
                     defaultSpeedTestUrl = msg.data.speedTestURL || defaultSpeedTestUrl;
                     webDebugMode = !!msg.data.debug;
-                    cfCountry = normalizeProxyCountry(msg.data || {});
-                    proxyWarningRequired = !!msg.data.proxyWarning;
-                    proxyGeoCheckOK = msg.data.geoCheckOK !== false;
+                    // S6：读取后端重放能力标记（缺失 = 旧后端，不发 replay_results）。
+                    resultReplaySupported = !!(msg.data && msg.data.resultReplay);
+                    applyInitGeoState(msg.data);
                     proxyWarningBypassed = false;
+                    // 第三阶段修正：记录当前连接 init_config 到达时用户检查的代次，
+                    // 供初始化异步地区结果校验：只有代次未变时才应用。
+                    proxyCountryInitSeq = proxyCountryCheckSeq;
                     if (webDebugMode) log('调试模式已开启，错误将输出到程序 log');
                     if (proxyWarningRequired) log(`代理检测警告：当前网络标签 ${cfCountry}`);
                     const speedDefault = msg.data.speedTestDefault || msg.data.speedTestURL || AUTO_SPEED_URL_VALUE;
                     defaultSpeedTestUrl = speedDefault || defaultSpeedTestUrl;
-                    applySpeedUrlConfig('officialSpeedUrl', 'officialSpeedUrlPreset', speedDefault);
-                    applySpeedUrlConfig('nsbSpeedUrl', 'nsbSpeedUrlPreset', speedDefault);
+                    if (!officialSpeedUrlUserEdited) applySpeedUrlConfig('officialSpeedUrl', 'officialSpeedUrlPreset', speedDefault);
+                    if (!nsbSpeedUrlUserEdited) applySpeedUrlConfig('nsbSpeedUrl', 'nsbSpeedUrlPreset', speedDefault);
                     applySpeedURLStatus(msg.data.speedURLStatus);
                     applyProxyStatus(msg.data.proxyStatus);
                     renderVersionInfo(msg.data || {});
                     autoLoadConfig();
+                    // 第四阶段 B 批次 R3：记录本连接 epoch（见 §10.5 步骤 1）。
+                    // epoch 变化时重置 appliedVersion=0 并丢弃旧 epoch 的待决恢复状态
+                    // （比较发生在 init_config 时，不是 ack 之后，见 §10.5 恢复路径步骤 2）。
+                    const epochChanged = prevBackendEpoch !== '' && newEpoch !== prevBackendEpoch;
+                    if (epochChanged) {
+                        appliedVersion = 0;
+                        clearPendingRecovery();
+                        // S7 C3 M-5（状态机 §2.2/§3.6）：epoch 变化逐字段处置——旧身份整体作废、不重试，
+                        // 新流恢复 → idle，计时器取消，令牌失效；appliedVersion/clearPendingRecovery 既有行为不动。
+                        disposeEpochIdentities();
+                        perfLog('ws_epoch_changed', 'old=' + prevBackendEpoch + ' new=' + newEpoch);
+                    }
+                    prevBackendEpoch = newEpoch;
+                    initConfigEpoch = newEpoch;
+                    initConfigReceived = true;
+                    backfillBusinessQueueEpoch();
+                    tryRegisterPage();
                     break;
+                case 'task_started': {
+                    // S7 C3 P1 §1/§5(a)，第十二轮 D-γ 统一规则：不同身份到达时立即采用为当前身份，
+                    // 不检查 lastTerminalIdentity；原当前身份先快照再移入后台列表，顺序不得颠倒。
+                    const d = msg.data || {};
+                    if (typeof d.taskId !== 'string' || !d.taskId || typeof d.backendEpoch !== 'string' || !d.backendEpoch) {
+                        perfLog('task_started_malformed_discarded', 'task=' + (d.taskId || '') + ' epoch=' + (d.backendEpoch || ''));
+                        break;
+                    }
+                    if (foregroundTaskIdentity && foregroundTaskIdentity.taskId === d.taskId && foregroundTaskIdentity.backendEpoch === d.backendEpoch) {
+                        perfLog('task_started_duplicate_ignored', 'task=' + d.taskId);
+                        break;
+                    }
+                    displaceForegroundIdentityToBackground(Date.now());
+                    foregroundTaskIdentity = { taskId: d.taskId, backendEpoch: d.backendEpoch, pageId: pageId, terminalAttribution: 'pending', receiptAt: null };
+                    currentBackgroundTaskId = d.taskId;
+                    // S7 C3 P5/F-2 + P4 M-5：新流已采用（D-γ），已终结流的迟到行隔离标记失效——此后新流行正常消费。
+                    expiredStreamRowGuard = null;
+                    perfLog('task_started_adopted', 'task=' + d.taskId + ' epoch=' + d.backendEpoch);
+                    break;
+                }
+                case 'register_page_ack': {
+                    // 第四阶段 B 批次 R3：注册确认（见设计 v22.2 §1.4/§10.5 步骤 4）。
+                    // 校验 pageId 与本页一致、epoch 与 initConfigEpoch 一致，
+                    // 不一致则丢弃本连接并重连（防御性分支）；随后按顺序执行：
+                    // purge 队列 → 消费暂存的 connect-time 信号 → FIFO 放行队列 →
+                    // 启动心跳 → 发送恢复查询（若有未确认意图）。
+                    const d = msg.data || {};
+                    if (pageRegistered) {
+                        perfLog('ws_duplicate_ack_ignored', '');
+                        break;
+                    }
+                    if (!d.pageId || d.pageId !== pageId) {
+                        perfLog('ws_ack_page_mismatch', 'ack=' + (d.pageId || '') + ' page=' + pageId);
+                        if (ws) { try { ws.close(); } catch (e) {} }
+                        break;
+                    }
+                    if (!d.backendEpoch || !initConfigEpoch || d.backendEpoch !== initConfigEpoch) {
+                        perfLog('ws_ack_epoch_mismatch', 'ack=' + (d.backendEpoch || '') + ' init=' + initConfigEpoch);
+                        if (ws) { try { ws.close(); } catch (e) {} }
+                        break;
+                    }
+                    registerRejectedCount = 0;
+                    pageRegistered = true;
+                    purgeBusinessQueueForAck(d.backendEpoch);
+                    consumeConnectTimeSignal();
+                    flushBusinessQueue();
+                    startHeartbeat(perfConnSeq);
+                    sendRecoveryQuery();
+                    // S7 C3 P2 §5(a)：注册成功后发首次认领（核对 epoch 等于保存 epoch，
+                    // 串行化空闲时发送；无保存身份/代次不符/已有在途认领时为空操作）。
+                    sendFirstClaimAfterAck();
+                    break;
+                }
+                case 'register_page_rejected': {
+                    // 第四阶段 B 批次 R3：注册被拒（见设计 v22.2 §1.7）。
+                    // 丢弃本连接并重连（pageId 不变，重试注册）；连续 3 次被拒则
+                    // 停止重连并提示，需用户手动刷新页面恢复（前端本地策略）。
+                    const reason = (msg.data && msg.data.reason) || '';
+                    registerRejectedCount += 1;
+                    perfLog('ws_register_rejected', 'reason=' + reason + ' count=' + registerRejectedCount);
+                    if (registerRejectedCount >= 3) {
+                        registerRejectedStop = true;
+                        log('注册连续被拒绝 3 次，已停止重连，请检查后端状态后手动刷新页面');
+                        if (ws) { try { ws.close(); } catch (e) {} }
+                        break;
+                    }
+                    log('注册被服务端拒绝（' + reason + '），正在重连…');
+                    if (ws) { try { ws.close(); } catch (e) {} }
+                    break;
+                }
+                case 'heartbeat_ack':
+                    // 第四阶段 A 批次：应用层心跳确认，只更新最近确认时间并清除等待超时，
+                    // 不触碰任何业务状态。旧连接的消息到不了这里（其 onmessage 已解除），
+                    // 到达的确认只属于当前有效连接。
+                    lastHeartbeatAckAt = Date.now();
+                    if (heartbeatAckTimer) { clearTimeout(heartbeatAckTimer); heartbeatAckTimer = null; }
+                    break;
+                case 'resume_accepted': {
+                    // S7 C3 P2：三项核验（代次 + taskId + backendEpoch + 状态为 claiming）。
+                    // 后端回显请求值，不替前端核验（协议核对表 §3；server.go:941/:946）。
+                    const d = msg.data || {};
+                    const ident = foregroundTaskIdentity;
+                    if (!ident) {
+                        perfLog('ws_resume_accepted_no_identity', '');
+                        break;
+                    }
+                    if (claimGen !== perfConnSeq) {
+                        perfLog('ws_resume_accepted_stale_gen', '');
+                        break;
+                    }
+                    if (typeof d.taskId !== 'string' || d.taskId !== ident.taskId ||
+                        typeof d.backendEpoch !== 'string' || d.backendEpoch !== ident.backendEpoch) {
+                        // 身份不匹配 → 丢弃回执、不清身份、不发 replay，按无应答处理（等待计时器继续）。
+                        perfLog('ws_resume_accepted_identity_mismatch', 'task=' + (d.taskId || '') + ' epoch=' + (d.backendEpoch || ''));
+                        break;
+                    }
+                    if (claimState !== 'claiming') {
+                        // 重复回执（已 replaying/recovered 且身份一致）→ 忽略，不重置恢复上下文，不重发重放。
+                        perfLog('ws_resume_accepted_duplicate_ignored', 'state=' + claimState);
+                        break;
+                    }
+                    // 核验通过：停认领定时器，调用 requestReplay()（A-3）。
+                    stopClaimTimers();
+                    claimState = 'accepted';
+                    perfLog('ws_resume_accepted', 'task=' + ident.taskId);
+                    requestReplay('initial');
+                    break;
+                }
+                case 'resume_rejected': {
+                    // S7 C3 P2/P3：按 6 理由分流（协议核对表 §3：task-not-found / epoch-mismatch /
+                    // not-owner / not-pending / already-claimed / already-cancelled）。
+                    // R3 的 recovery_rejected（queue-full / pending-capacity / not-owner，发布意图查询侧）
+                    // 一字不动，不得复用其分流逻辑。
+                    const d = msg.data || {};
+                    const reason = (d && typeof d.reason === 'string') ? d.reason : '';
+                    if (claimState !== 'claiming') {
+                        perfLog('ws_resume_rejected_stale', 'reason=' + reason + ' state=' + claimState);
+                        break;
+                    }
+                    if (claimGen !== perfConnSeq) {
+                        perfLog('ws_resume_rejected_stale_gen', 'reason=' + reason);
+                        break;
+                    }
+                    const ident = foregroundTaskIdentity;
+                    if (!ident) {
+                        perfLog('ws_resume_rejected_no_identity', 'reason=' + reason);
+                        break;
+                    }
+                    // 身份字段若存在须匹配；空字段/解析失败时后端只发 reason（task-not-found），按 reason 路由。
+                    if ((typeof d.taskId === 'string' && d.taskId !== '' && d.taskId !== ident.taskId) ||
+                        (typeof d.backendEpoch === 'string' && d.backendEpoch !== '' && d.backendEpoch !== ident.backendEpoch)) {
+                        perfLog('ws_resume_rejected_identity_mismatch', 'reason=' + reason);
+                        break;
+                    }
+                    // 回执到达：取消认领等待计时器。
+                    if (claimWaitTimer) { clearTimeout(claimWaitTimer); claimWaitTimer = null; }
+                    claimLastReason = reason;
+                    if (reason === 'epoch-mismatch') {
+                        // 终态：旧身份作废，不重试（状态机 §2.2 → missing）。
+                        stopClaimTimers();
+                        claimState = 'idle';
+                        perfLog('ws_resume_rejected_terminal', 'reason=epoch-mismatch');
+                        updateStatus('任务代次已变化，旧任务不可恢复', false);
+                        disposeEpochIdentities();
+                        break;
+                    }
+                    if (reason === 'not-owner' || reason === 'already-claimed' || reason === 'already-cancelled') {
+                        // 终态：立即停止，0 次额外重试。
+                        stopClaimTimers();
+                        claimState = 'idle';
+                        perfLog('ws_resume_rejected_terminal', 'reason=' + reason);
+                        clearForegroundRecoveryForTerminal(reason);
+                        break;
+                    }
+                    // 瞬态可重试：not-pending / task-not-found / 未知 reason（按无应答处理）。
+                    perfLog('ws_resume_rejected_retryable', 'reason=' + (reason || 'unknown') + ' count=' + claimSentCount + ' phase=' + claimPhase);
+                    scheduleClaimRetryAfterNoAnswer();
+                    break;
+                }
+                case 'replay_complete': {
+                    // S7 C3 P4：四条件接受规则 (d)→(a)→(b)→(c) + D4 字段校验 + 六项唯一完成条件（已 confirmed 任务）。
+                    // 既有 checkReplayComplete 双条件判定本身不动，只在其外加守卫；S6 §5.4.3 双条件仍用于未终结任务。
+                    const d = msg.data || {};
+                    // (d) 状态守卫：仅在等待重放响应时处理；重放已达终态结果后到达的完成按过期丢弃。
+                    if (replayState !== 'requesting' && replayState !== 'replaying') {
+                        perfLog('replay_complete_discarded_state', 'state=' + replayState + ' task=' + (d.taskId || '') + ' requestId=' + (d.requestId || ''));
+                        break;
+                    }
+                    // (a) taskId：缺失/类型错误/不匹配 → 丢弃（fail-closed；旧代码“字段存在才比对”为 fail-open，已废除）。
+                    if (typeof d.taskId !== 'string' || !d.taskId || d.taskId !== replayTaskId) {
+                        perfLog('replay_complete_discarded_identity', 'field=taskId value=' + (typeof d.taskId === 'string' ? d.taskId : 'missing_or_type_error') + ' current=' + replayTaskId);
+                        break;
+                    }
+                    // (b) backendEpoch：缺失/类型错误/不匹配 → 丢弃（fail-closed）。
+                    if (typeof d.backendEpoch !== 'string' || !d.backendEpoch || d.backendEpoch !== initConfigEpoch) {
+                        perfLog('replay_complete_discarded_identity', 'field=backendEpoch value=' + (typeof d.backendEpoch === 'string' ? d.backendEpoch : 'missing_or_type_error') + ' current=' + initConfigEpoch);
+                        break;
+                    }
+                    // (c) requestId：缺失/非字符串/空串恒失败；与当前请求不等 → 旧请求的迟到完成。
+                    // P0 门控说明：本树后端已在 session.go:620 回显 requestId（七字段），故本门可执行；
+                    // 无 requestId 的完成消息按本门恒失败而丢弃（诊断 replay_complete_missing_request_id）。
+                    if (typeof d.requestId !== 'string' || !d.requestId) {
+                        const why = (d.requestId === undefined || d.requestId === null) ? 'missing' : (d.requestId === '' ? 'empty' : 'type_error');
+                        perfLog('replay_complete_missing_request_id', 'reason=' + why);
+                        break;
+                    }
+                    if (d.requestId !== currentReplayRequestId) {
+                        // 旧请求的迟到完成：只终结自己的账本记录，零其他效应（R-L3）。
+                        terminateLedgerRecordForLateResponse(d.requestId, 'completed');
+                        perfLog('replay_complete_discarded_generation', 'requestId=' + d.requestId + ' current=' + (currentReplayRequestId || 'no_outstanding_request'));
+                        break;
+                    }
+                    // D4：必需字段存在且类型正确 + 字段一致性校验（失败 → fail-closed 丢弃，请求仍在等待中）。
+                    // 协议不变量：lastSeq 恒等于 replayThroughSeq（session.go:614）；final=true 时
+                    // totalSeq == replayThroughSeq == finalSeq（v7 §5.4.1），故 totalSeq < through 恒为非法。
+                    if (typeof d.replayThroughSeq !== 'number' || !Number.isFinite(d.replayThroughSeq) || d.replayThroughSeq < 0 ||
+                        typeof d.totalSeq !== 'number' || !Number.isFinite(d.totalSeq) || d.totalSeq < 0 ||
+                        typeof d.final !== 'boolean' ||
+                        (d.lastSeq !== undefined && (typeof d.lastSeq !== 'number' || d.lastSeq !== d.replayThroughSeq)) ||
+                        d.totalSeq < d.replayThroughSeq) {
+                        perfLog('replay_complete_discarded_fields', 'through=' + d.replayThroughSeq + ' total=' + d.totalSeq + ' final=' + d.final + ' lastSeq=' + d.lastSeq);
+                        break;
+                    }
+                    // 四条件 + D4 通过：采纳边界（取 max，仅适用于已接受消息）。
+                    // 静默计数清零点（C-R6 修订）：仅当该完成满足水位条件（或触发边界扩展发送）时清零；
+                    // 尾部缺口完成（final=true 且水位不足）不清零——故此处不清零，各分支按规则处理。
+                    const acceptedThrough = Math.max(replayThroughSeq, d.replayThroughSeq);
+                    const acceptedRequestId = d.requestId;
+                    replayThroughSeq = acceptedThrough;
+                    replayCompleteReceived = true;
+                    perfLog('ws_replay_complete_received', 'task=' + replayTaskId + ' through=' + replayThroughSeq + ' lastSeq=' + replayLastSeq + ' final=' + d.final + ' totalSeq=' + d.totalSeq);
+                    const confirmed = isReplayTaskConfirmed();
+                    if (!confirmed && replayLastSeq >= replayThroughSeq) {
+                        // 未终结任务：S6 §5.4.3 双条件满足 → recovered（final 不参与本轮次完成判定）。
+                        replaySilentRetryCount = 0;
+                        ledgerSetState(acceptedRequestId, 'completed');
+                        currentReplayRequestId = null;
+                        cancelReplayWaitTimer();
+                        checkReplayComplete();
+                        break;
+                    }
+                    if (confirmed && d.final === true && replayLastSeq >= replayThroughSeq) {
+                        // 已 confirmed 任务：六项完成条件全部满足。状态经 checkReplayComplete()
+                        // （S6 机制本身不动）置为 'done'；另按 §2.3 idle 表做变量清理：
+                        // 清零 current/计数/耗尽；缓冲空 → 取消缺口计时器；保留 replayTaskId /
+                        // currentBackgroundTaskId / replayLastSeq / 缓冲内容。
+                        ledgerSetState(acceptedRequestId, 'completed');
+                        currentReplayRequestId = null;
+                        cancelReplayWaitTimer();
+                        checkReplayComplete();
+                        replaySilentRetryCount = 0;
+                        replayExhausted = false;
+                        replayTailGap = false;
+                        if (replayPending.size === 0 && replayGapTimer) { clearTimeout(replayGapTimer); replayGapTimer = null; }
+                        break;
+                    }
+                    if (d.final === false && d.totalSeq > replayThroughSeq) {
+                        // 边界扩展重请求：以当前 replayLastSeq 为起点、新 requestId、不计入失败预算。
+                        // F6 (i)：仅发送确认时取消旧等待计时器并终结旧记录；发送未确认时旧记录保持
+                        // inflight、身份保持当前请求、旧等待计时器保留。
+                        // 完成触发边界扩展发送时清零静默计数（C-R6）。
+                        replaySilentRetryCount = 0;
+                        const oldRequestId = acceptedRequestId;
+                        const sendResult = requestReplay('boundary-extension');
+                        if (sendResult === true) ledgerSetState(oldRequestId, 'completed');
+                        break;
+                    }
+                    if (d.final === true && replayLastSeq < replayThroughSeq) {
+                        // 边界内缺口：水位不足，保持 replaying。
+                        if (replayPending.size === 0) {
+                            // 尾部缺口（n12.1）：四条件 + D4 + final=true + 水位不足 + 缓冲为空。
+                            ledgerSetState(acceptedRequestId, 'completed');
+                            currentReplayRequestId = null;
+                            cancelReplayWaitTimer();
+                            if (replaySilentRetryCount >= 3) {
+                                replayExhausted = true;
+                                replayTailGap = false;
+                                perfLog('ws_replay_tail_gap_exhausted', 'task=' + replayTaskId);
+                            } else {
+                                replayTailGap = true;
+                                perfLog('ws_replay_tail_gap_detected', 'task=' + replayTaskId + ' through=' + replayThroughSeq + ' lastSeq=' + replayLastSeq);
+                                armReplayWaitTimer(acceptedRequestId, 'tail-gap', 2000);
+                            }
+                        } else {
+                            // 缓冲非空：缺口填补进行中，沿用既有缺口机制（未武装时补武装）。
+                            scheduleReplayGapTimeout();
+                        }
+                        break;
+                    }
+                    // 其余情形（final=false 且无新行、或 final=true 且水位已达但未确认）：保持 replaying，不清理。
+                    break;
+                }
+                case 'replay_rejected': {
+                    // S7 C3 P4 (n6)：按门 (d)→(a)→(b)→(c) 重写 + reason 分流表。
+                    // 归属判定先于 reason 分流（reason 只在门全过且拒绝被判定为当前请求的拒绝之后才参与分流）。
+                    // 门 (a)(b) 为 fail-closed（缺字段即失败）；缺少 requestId 的拒绝 fail-closed 丢弃（Q-3 推荐）。
+                    const d = msg.data || {};
+                    // (d) 状态守卫：重放已达终态结果后到达的拒绝按过期丢弃（不得回退已完成状态）。
+                    if (replayState !== 'requesting' && replayState !== 'replaying') {
+                        perfLog('replay_rejected_discarded_state', 'state=' + replayState + ' reason=' + (d.reason || '') + ' requestId=' + (d.requestId || ''));
+                        break;
+                    }
+                    // (a) taskId：缺字段即失败（:844 型拒绝只有 {reason, requestId: ""}，无 taskId/epoch，三重不可归属）。
+                    if (typeof d.taskId !== 'string' || !d.taskId || d.taskId !== replayTaskId) {
+                        perfLog('replay_rejected_discarded_identity', 'field=taskId reason=' + (d.reason || ''));
+                        break;
+                    }
+                    // (b) backendEpoch：缺字段即失败。
+                    if (typeof d.backendEpoch !== 'string' || !d.backendEpoch || d.backendEpoch !== initConfigEpoch) {
+                        perfLog('replay_rejected_discarded_identity', 'field=backendEpoch reason=' + (d.reason || ''));
+                        break;
+                    }
+                    // (c) requestId：缺失/非字符串/空串恒失败；与当前请求不等 → 旧请求的拒绝。
+                    if (typeof d.requestId !== 'string' || !d.requestId) {
+                        perfLog('replay_rejected_discarded_generation', 'reason=' + (d.reason || '') + ' requestId=missing_or_empty');
+                        break;
+                    }
+                    if (d.requestId !== currentReplayRequestId) {
+                        // 旧请求的拒绝：只终结自己的账本记录，零其他效应（M-R3：不得回退当前请求）。
+                        terminateLedgerRecordForLateResponse(d.requestId, 'rejected');
+                        perfLog('replay_rejected_discarded_generation', 'reason=' + (d.reason || '') + ' requestId=' + d.requestId + ' current=' + (currentReplayRequestId || 'no_outstanding_request'));
+                        break;
+                    }
+                    // 门全过：当前请求的拒绝，按 reason 分流。
+                    const reason = d.reason || '';
+                    const currentId = d.requestId;
+                    perfLog('ws_replay_rejected', 'reason=' + reason + ' task=' + replayTaskId + ' requestId=' + currentId);
+                    if (reason === 'task-not-found' || reason === 'epoch-mismatch' || reason === 'not-owner') {
+                        // 终态 → missing：当前记录 → rejected，身份 → null，取消等待计时器，计数清零；
+                        // 重放变量按 missing 表清理（replayTaskId 清空、后台槽位清除、水位清零、缓冲清空、计时器全取消）。
+                        ledgerSetState(currentId, 'rejected');
+                        currentReplayRequestId = null;
+                        cancelReplayWaitTimer();
+                        replayTailGap = false;
+                        resetReplayState();
+                        currentBackgroundTaskId = '';
+                        if (reason === 'epoch-mismatch') disposeEpochIdentities();
+                        else clearForegroundRecoveryForTerminal(reason);
+                        break;
+                    }
+                    if (reason === 'log-truncated' || reason === 'log-expired') {
+                        // 终态对账：当前记录 → rejected，身份 → null，取消等待计时器，计数清零；不自动重请求。
+                        ledgerSetState(currentId, 'rejected');
+                        currentReplayRequestId = null;
+                        cancelReplayWaitTimer();
+                        replaySilentRetryCount = 0;
+                        replayExhausted = false;
+                        replayTailGap = false;
+                        if (isReplayTaskConfirmed()) {
+                            // 已 confirmed → idle（idle 表：保留 replayTaskId / currentBackgroundTaskId /
+                            // replayLastSeq / 缓冲内容；缓冲空 → 取消缺口计时器）。
+                            if (replayPending.size === 0 && replayGapTimer) { clearTimeout(replayGapTimer); replayGapTimer = null; }
+                            replayState = 'idle';
+                            perfLog('ws_replay_rejected_idle', 'reason=' + reason);
+                        } else {
+                            // 未终结 → recovered（降级），不自动重请求。
+                            replayState = 'done';
+                            perfLog('ws_replay_rejected_recovered', 'reason=' + reason);
+                        }
+                        break;
+                    }
+                    // 未知 reason 的当前拒绝（缺失/空/不在 5 值全集内）→ R-R1 有界跟进（n5）：
+                    // 记录 → rejected；身份 → null；取消等待计时器；计数不清零；
+                    // 若计数 < 3，复用 replayWaitTimer 启动跟进计时器（延迟 2 秒 PROVISIONAL，M-4），
+                    // 触发时发送新请求（trigger=rejection-followup，发送尝试时计数 +1）；
+                    // 计数已为 3 时进入 replaying(exhausted)。不另设独立拒绝重试计时器/计数器。
+                    // 缺口计时器：已运行的保留，与跟进计时器赛跑；拒绝本身永不重装缺口计时器（C-R3）。
+                    ledgerSetState(currentId, 'rejected');
+                    currentReplayRequestId = null;
+                    cancelReplayWaitTimer();
+                    if (replaySilentRetryCount < 3) {
+                        perfLog('ws_replay_rejection_followup', 'requestId=' + currentId + ' reason=' + (reason || 'unknown'));
+                        armReplayWaitTimer(currentId, 'rejection-followup', 2000);
+                    } else {
+                        replayExhausted = true;
+                        perfLog('ws_replay_timeout_exhausted', 'reason=rejection-followup-exhausted requestId=' + currentId);
+                    }
+                    break;
+                }
                 case 'speed_url_status':
+                    // 第三阶段性能日志：异步测速源解析结果到达时间；只更新测速源可用性标注，不改输入值。
+                    perfLog('ws_speed_url_status', 'ready=' + (msg.data && msg.data.ready));
                     applySpeedURLStatus(msg.data || {});
                     break;
                 case 'proxy_status':
@@ -6315,6 +8657,8 @@
                     renderVersionInfo(msg.data || {});
                     break;
                 case 'proxy_country_result':
+                    // 第三阶段性能日志：异步地区探测结果到达时间；source=init 时只更新状态，不重初始化。
+                    perfLog('ws_proxy_country_result', 'source=' + ((msg.data && msg.data.source) || 'manual'));
                     handleProxyCountryResult(msg.data || {});
                     break;
                 case 'config_data':
@@ -6327,14 +8671,17 @@
                     break;
                 case 'scan_result':
                     if (isStoppingTask) break;
-                    addScanResult(msg.data, currentMode === 'official' && runningTaskMode !== 'nsb');
+                    applyResultRow('scan', msg.data);
                     break;
                 case 'scan_complete_wait_dc':
                     const wasStoppingScan = isStoppingTask;
+                    // S6：扫描终态到达，置 scan 终态位（scan 无全量数组，不置对账位，见设计 v7 §5.7.1）。
+                    typeTerminal.scan = true;
                     finishRunningTask('✨ 重新开始扫描');
                     if (currentMode === 'official') {
                         sortAndRenderScanResults();
                         showDCSelection(msg.data);
+                        bumpDataGen();
                         if (!wasStoppingScan) {
                             completeProgressWithCurrentCount('扫描完成，选择数据中心');
                         }
@@ -6348,7 +8695,7 @@
                     break;
                 case 'test_result':
                     if (isStoppingTask) break;
-                    addTestResult(msg.data, currentMode === 'official' && document.getElementById('test').classList.contains('active'));
+                    applyResultRow('test', msg.data);
                     break;
                 case 'test_complete':
                     if (isStoppingTask) {
@@ -6358,6 +8705,10 @@
                     }
                     if (currentMode === 'official') {
                         testData = msg.data;
+                        // S6：终态全量到达，置 test 终态位与对账位（不置 replayState=done，见设计 v7 §5.7.1）。
+                        typeTerminal.test = true;
+                        typeReconciled.test = true;
+                        bumpDataGen();
                         renderAllTestResults();
                         onTestComplete();
                         officialTestCompletePending = true;
@@ -6374,7 +8725,7 @@
                     break;
                 case 'speed_test_result':
                     if (isStoppingTask) break;
-                    updateSpeedResult(msg.data);
+                    applyResultRow('speed', msg.data);
                     break;
                 case 'official_speed_progress':
                     if (isStoppingTask) break;
@@ -6389,6 +8740,8 @@
                         log('任务已手动终止');
                         break;
                     }
+                    // S6：测速终态到达，置 speed 终态位（speed 无全量数组，不置对账位，见设计 v7 §5.7.1）。
+                    typeTerminal.speed = true;
                     officialAutoSpeedPending = false;
                     officialAutoStage = '';
                     officialBatchSpeedRunning = false;
@@ -6467,11 +8820,7 @@
                     }
                     break;
                 case 'nsb_scan_result':
-                    if (nsbBatchSpeedRunning) {
-                        updateNSBDisplayedResult(msg.data || {});
-                    } else {
-                        addNSBLiveResult(msg.data || {}, currentMode === 'nsb');
-                    }
+                    applyResultRow('nsb', msg.data || {});
                     break;
                 case 'nsb_scan_sorted':
                     nsbLiveRows = [];
@@ -6513,6 +8862,9 @@
                     nsbStopHandledByComplete = wasStoppingNSB;
                     nsbHeaders = msg.data.headers || [];
                     nsbRows = msg.data.rows || [];
+                    // S6：终态全量到达，置 nsb 终态位与对账位（不置 replayState=done，见设计 v7 §5.7.1）。
+                    typeTerminal.nsb = true;
+                    typeReconciled.nsb = true;
                     nsbLiveRows = [];
                     nsbLiveIndex = {};
                     nsbLiveRowElements = {};
@@ -6538,28 +8890,322 @@
                     autoUploadNSBResults();
                     break;
 
-                case 'background_task_enabled':
-                case 'background_task_found':
+                case 'background_task_enabled': {
+                    // 转入后台是前端主动请求的结果，回复即当前正在运行的任务，
+                    // 属建立任务身份的明确路径。意图的清除与快照的应用独立
+                    // （见设计 v22.2 §10.1/§10.4）：清除按 publishId（无条件），
+                    // 快照经 applyVersionedSnapshot 的版本守卫决定是否应用。
+                    // 兼容旧后端扁平快照（data 即快照，无 publishId/epoch/version）：
+                    // 无字段时跳过对应校验，按旧行为处理。
+                    const d = msg.data || {};
+                    const snap = (d.snapshot && typeof d.snapshot === 'object') ? d.snapshot : d;
+                    const epoch = d.backendEpoch || snap.backendEpoch || '';
+                    const version = (d.taskVersion !== undefined) ? d.taskVersion : snap.taskVersion;
+                    if (d.publishId && pendingPublishIntents[d.publishId]) {
+                        delete pendingPublishIntents[d.publishId];
+                        perfLog('ws_intent_resolved', 'publishId=' + d.publishId + ' outcome=published');
+                    }
+                    if (applyVersionedSnapshot(epoch, version, snap) === 'ok') {
+                        noteBackgroundTaskId(snap, false);
+                    } else {
+                        perfLog('ws_stale_version_dropped', 'type=enabled version=' + version + ' applied=' + appliedVersion);
+                    }
+                    break;
+                }
+
+                case 'background_task_found': {
+                    // 连接时后端发来的当前后台任务快照，属建立/确认身份的明确路径；
+                    // 恢复等待期间的 found 是本次恢复的决议（代次由 recoveryPending
+                    // 保证属于当前连接），任务变更时清空旧数据。
+                    // 注册确认前到达的 connect-time 信号暂存至 ack 后消费（见 §10.5）；
+                    // 注册后到达的按正常流程处理（防御分支）。
+                    const d = msg.data || {};
+                    if (!pageRegistered) {
+                        const snap0 = (d.snapshot && typeof d.snapshot === 'object') ? d.snapshot : d;
+                        pendingConnectTimeSignal = { type: 'background_task_found', data: d, epoch: d.backendEpoch || snap0.backendEpoch || '' };
+                        perfLog('ws_connect_time_stashed', 'type=found');
+                        break;
+                    }
+                    // 意图的清除与快照的应用独立（见 §10.6）：先按 publishOutcomes
+                    // 逐条清除终态意图，再由版本守卫决定快照是否应用。
+                    processPublishOutcomes(d.publishOutcomes);
+                    const snap = (d.snapshot && typeof d.snapshot === 'object') ? d.snapshot : d;
+                    const epoch = d.backendEpoch || snap.backendEpoch || '';
+                    const version = (d.taskVersion !== undefined) ? d.taskVersion : snap.taskVersion;
+                    const verdict = applyVersionedSnapshot(epoch, version, snap);
+                    if (verdict === 'stale-epoch') {
+                        perfLog('ws_stale_epoch_dropped', 'type=found epoch=' + epoch + ' current=' + initConfigEpoch);
+                        break;
+                    }
+                    if (verdict === 'ok') {
+                        noteBackgroundTaskId(snap, recoveryPending);
+                        perfLog('ws_background_task_found', '');
+                        log('检测到后台任务，已显示状态卡片');
+                        // S6：任务身份确认后请求重放断线期间丢失的结果行（见设计 v7 §5.4）。
+                        requestReplay('found');
+                    } else {
+                        perfLog('ws_stale_version_dropped', 'type=found version=' + version + ' applied=' + appliedVersion);
+                    }
+                    // 第四阶段 B 批次：恢复等待结束，任务存在，旧数据保留。
+                    // 版本守卫丢弃的迟到/重复 found 同样结束等待——当前显示已是
+                    // 更新或相同的状态，恢复决议已满足。
+                    if (recoveryPending) {
+                        perfLog('ws_recovery_resolved', 'result=found');
+                        endRecoveryWait();
+                    }
+                    break;
+                }
+
                 case 'background_task_update':
-                    applyBackgroundSnapshot(msg.data || {});
-                    if (msg.type === 'background_task_found') log('检测到后台任务，已显示状态卡片');
+                    // 状态轮询的回复：必须与当前任务身份一致才应用；
+                    // 带不同 ID 的旧任务更新直接丢弃，不得调用快照、不得更新 UI/状态/ID。
+                    // 无 taskId 的旧快照降级规则：已有身份时丢弃（不能绕过身份保护）；
+                    // 无身份时应用（无可保护的内容）。通过 R1/R2 检查后经版本守卫。
+                    {
+                        const d = msg.data || {};
+                        const snap = (d.snapshot && typeof d.snapshot === 'object') ? d.snapshot : d;
+                        const incomingId = snap.taskId || '';
+                        if (incomingId && currentBackgroundTaskId && incomingId !== currentBackgroundTaskId) {
+                            perfLog('ws_stale_update_dropped', 'task=' + incomingId + ' current=' + currentBackgroundTaskId);
+                            break;
+                        }
+                        if (!incomingId && currentBackgroundTaskId) {
+                            perfLog('ws_unidentified_update_dropped', 'current=' + currentBackgroundTaskId);
+                            break;
+                        }
+                        const epoch = d.backendEpoch || snap.backendEpoch || '';
+                        const version = (d.taskVersion !== undefined) ? d.taskVersion : snap.taskVersion;
+                        const verdict = applyVersionedSnapshot(epoch, version, snap);
+                        if (verdict === 'stale-epoch') {
+                            perfLog('ws_stale_epoch_dropped', 'type=update epoch=' + epoch + ' current=' + initConfigEpoch);
+                            break;
+                        }
+                        if (verdict !== 'ok') {
+                            perfLog('ws_stale_version_dropped', 'type=update version=' + version + ' applied=' + appliedVersion);
+                            break;
+                        }
+                        if (incomingId) currentBackgroundTaskId = incomingId;
+                    }
                     break;
 
                 case 'background_task_following':
-                    backgroundTaskFollowing = true;
-                    stopBackgroundStatusPolling();
-                    applyBackgroundSnapshot(msg.data || {});
-                    log('已开始跟随后台任务实时数据');
+                    // 跟随回复：必须与本次跟随请求的目标任务一致才接受。
+                    // 请求有明确目标时，回复必须带相同的 taskId（无 ID 视为无法验证，丢弃），
+                    // 且请求目标仍是当前身份（任务未在请求发出后切换）。
+                    // 请求无明确目标时（发出时前端未知任务 ID），接受新鲜回复，带 ID 则记录身份。
+                    // 无请求时到达的是迟到消息，须与当前任务身份一致才应用，否则丢弃。
+                    // 无 taskId 的旧快照降级规则与 update 相同：已有身份且无请求时丢弃。
+                    // 通过 R1/R2 检查后经版本守卫；回复已到达即清除请求状态（即使快照
+                    // 被版本守卫丢弃，请求本身已被应答，不再等待）。
+                    {
+                        const d = msg.data || {};
+                        const snap = (d.snapshot && typeof d.snapshot === 'object') ? d.snapshot : d;
+                        const incomingId = snap.taskId || '';
+                        if (followRequestPending) {
+                            if (followRequestTaskId) {
+                                if (incomingId !== followRequestTaskId ||
+                                    (currentBackgroundTaskId && currentBackgroundTaskId !== followRequestTaskId)) {
+                                    perfLog('ws_stale_following_dropped', 'task=' + incomingId + ' expected=' + followRequestTaskId + ' current=' + currentBackgroundTaskId);
+                                    break;
+                                }
+                            }
+                        } else {
+                            if (incomingId && currentBackgroundTaskId && incomingId !== currentBackgroundTaskId) {
+                                perfLog('ws_stale_following_dropped', 'task=' + incomingId + ' current=' + currentBackgroundTaskId);
+                                break;
+                            }
+                            if (!incomingId && currentBackgroundTaskId) {
+                                perfLog('ws_unidentified_following_dropped', 'current=' + currentBackgroundTaskId);
+                                break;
+                            }
+                        }
+                        followRequestPending = false;
+                        followRequestTaskId = '';
+                        const epoch = d.backendEpoch || snap.backendEpoch || '';
+                        const version = (d.taskVersion !== undefined) ? d.taskVersion : snap.taskVersion;
+                        const verdict = applyVersionedSnapshot(epoch, version, snap);
+                        if (verdict === 'stale-epoch') {
+                            perfLog('ws_stale_epoch_dropped', 'type=following epoch=' + epoch + ' current=' + initConfigEpoch);
+                            break;
+                        }
+                        if (verdict !== 'ok') {
+                            perfLog('ws_stale_version_dropped', 'type=following version=' + version + ' applied=' + appliedVersion);
+                            break;
+                        }
+                        backgroundTaskFollowing = true;
+                        stopBackgroundStatusPolling();
+                        noteBackgroundTaskId(snap, false);
+                        log('已开始跟随后台任务实时数据');
+                        // S6：跟随后请求重放断线期间丢失的结果行（见设计 v7 §5.4）。
+                        requestReplay('following');
+                    }
                     break;
 
                 case 'background_task_missing':
-                    backgroundTaskActive = false;
-                    backgroundTaskFollowing = false;
-                    stopBackgroundStatusPolling();
-                    finishRunningTask('✨ 开始扫描与测试');
+                    // 第四阶段 B 批次：恢复等待结束，确认后端无可恢复任务，旧会话数据不可恢复。
+                    // 三路拆分：targetsOld 时清理旧任务数据与旧任务状态；
+                    // 等待期间已有新任务时，只结束等待，不得清除新任务的 ID、运行标志、
+                    // 跟随状态或轮询；非恢复期间的 missing（状态轮询）保持原有行为。
+                    // 注册确认前到达的 connect-time 信号暂存至 ack 后消费（见 §10.5）。
+                    {
+                        const d = msg.data || {};
+                        if (!pageRegistered) {
+                            pendingConnectTimeSignal = { type: 'background_task_missing', data: d, epoch: d.backendEpoch || '' };
+                            perfLog('ws_connect_time_stashed', 'type=missing');
+                            break;
+                        }
+                        // 意图的清除与 missing 本身的处理独立（见 §10.6）：
+                        // 先按 publishOutcomes 逐条清除终态意图，再由版本守卫决定
+                        // missing 是否生效（旧代次/旧版本的 missing 不得清空当前状态）。
+                        processPublishOutcomes(d.publishOutcomes);
+                        const epoch = d.backendEpoch || '';
+                        const version = d.taskVersion;
+                        const verdict = checkVersionedSignal(epoch, version, null);
+                        if (verdict === 'stale-epoch') {
+                            perfLog('ws_stale_epoch_dropped', 'type=missing epoch=' + epoch + ' current=' + initConfigEpoch);
+                            break;
+                        }
+                        if (verdict === 'stale-version') {
+                            perfLog('ws_stale_version_dropped', 'type=missing version=' + version + ' applied=' + appliedVersion);
+                            break;
+                        }
+                        const wasWaiting = recoveryPending;
+                        const targetsOld = wasWaiting && recoveryStillTargetsOldTask();
+                        if (wasWaiting) {
+                            perfLog('ws_recovery_resolved', 'result=missing');
+                            if (targetsOld) {
+                                clearRecoveredData();
+                                log('后端无可恢复的后台任务，旧会话数据已清空');
+                            } else {
+                                log('后端无可恢复的后台任务，但已有新任务在运行，保留当前任务状态');
+                            }
+                            endRecoveryWait();
+                        }
+                        // 等待期间已有新任务：只结束等待，不动新任务的任何状态。
+                        if (wasWaiting && !targetsOld) break;
+                        currentBackgroundTaskId = '';
+                        backgroundTaskActive = false;
+                        backgroundTaskFollowing = false;
+                        stopBackgroundStatusPolling();
+                        finishRunningTask('✨ 开始扫描与测试');
+                    }
                     break;
 
-                case 'task_stopped':
+                case 'background_task_pending': {
+                    // 恢复查询的中间态（见设计 v22.2 §10.5/§10.6）：服务端仍在等待
+                    // 其他连接的发布决议。前端仅提示，不清空数据、不结束任务；
+                    // 在 serverDeadline 到达时发 recovery_requery（同一 recoveryId）。
+                    // publishOutcomes 携带的终态结局按 §10.6 逐条清除意图。
+                    const d = msg.data || {};
+                    const epoch = d.backendEpoch || '';
+                    if (epoch && initConfigEpoch && epoch !== initConfigEpoch) {
+                        perfLog('ws_stale_epoch_dropped', 'type=pending epoch=' + epoch + ' current=' + initConfigEpoch);
+                        break;
+                    }
+                    if (!pendingRecovery || d.recoveryId !== pendingRecovery.recoveryId) {
+                        perfLog('ws_unexpected_pending_dropped', 'recoveryId=' + (d.recoveryId || '') + ' expected=' + (pendingRecovery ? pendingRecovery.recoveryId : ''));
+                        break;
+                    }
+                    processPublishOutcomes(d.publishOutcomes);
+                    pendingRecovery.serverDeadline = d.serverDeadline || null;
+                    pendingRecovery.waitForPublishIds = Array.isArray(d.waitForPublishIds) ? d.waitForPublishIds : [];
+                    scheduleRecoveryRequery();
+                    perfLog('ws_recovery_pending', 'recoveryId=' + d.recoveryId + ' deadline=' + (d.serverDeadline || ''));
+                    log('后台任务恢复查询等待服务端确认…');
+                    break;
+                }
+
+                case 'background_task_publish_failed': {
+                    // 发布失败的显式信号（见设计 v22.2 §10.1/§7.6）：按 publishId
+                    // 清除对应的未确认意图。reason ∈ {failed, already-failed,
+                    // already-superseded, page-mismatch}；generation-mismatch
+                    // 永不出现在此信号中（代次不匹配走 backend_restarted）。
+                    const d = msg.data || {};
+                    if (d.publishId && pendingPublishIntents[d.publishId]) {
+                        delete pendingPublishIntents[d.publishId];
+                        perfLog('ws_intent_resolved', 'publishId=' + d.publishId + ' outcome=failed reason=' + (d.reason || ''));
+                    }
+                    perfLog('ws_publish_failed', 'publishId=' + (d.publishId || '') + ' reason=' + (d.reason || ''));
+                    log('转入后台失败（' + (d.reason || 'failed') + '），请重试');
+                    break;
+                }
+
+                case 'recovery_rejected': {
+                    // 恢复查询被拒绝（见设计 v22.2 §10.1/§8.5）：reason ∈
+                    // {not-owner, queue-full, pending-capacity}。
+                    // queue-full / pending-capacity 是服务端暂时的容量拒绝：
+                    // 在 serverDeadline + 5s 后重查一次（同一 recoveryId），
+                    // 最多 3 次；not-owner 不重试（recoveryId 归属异常，仅记日志）。
+                    const d = msg.data || {};
+                    const reason = d.reason || '';
+                    perfLog('ws_recovery_rejected', 'recoveryId=' + (d.recoveryId || '') + ' reason=' + reason);
+                    if (!pendingRecovery || d.recoveryId !== pendingRecovery.recoveryId) break;
+                    if ((reason === 'queue-full' || reason === 'pending-capacity') && d.serverDeadline) {
+                        if (recoveryRejectedRetries < 3) {
+                            recoveryRejectedRetries += 1;
+                            clearRecoveryRequeryTimer();
+                            const delay = Math.max(0, d.serverDeadline - Date.now()) + 5000;
+                            recoveryRequeryTimer = setTimeout(() => {
+                                recoveryRequeryTimer = null;
+                                sendRecoveryRequery();
+                            }, delay);
+                        } else {
+                            log('恢复查询被拒绝多次，已放弃本次恢复，意图将由下次重连的恢复查询决议');
+                        }
+                    }
+                    break;
+                }
+
+                case 'backend_restarted': {
+                    // 后端已重启（见设计 v22.2 §10.1/§13.3）：关闭当前 socket，
+                    // 由 onclose 走统一重连流程。不应用任何状态、不清除
+                    // pendingPublishIntents（意图由新连接的恢复查询决议）。
+                    // S7 C3 M-5：先逐字段作废旧代次身份（不重试），再关闭 socket，
+                    // 使随后触发的 onclose 不再为已作废身份创建恢复令牌。
+                    const epoch = (msg.data && msg.data.backendEpoch) || '';
+                    perfLog('ws_backend_restarted', 'epoch=' + epoch);
+                    log('后端已重启，正在重连…');
+                    disposeEpochIdentities();
+                    if (ws) { try { ws.close(); } catch (e) {} }
+                    break;
+                }
+
+                case 'task_stopped': {
+                    // S7 C3 P1：D-γ 门控 + D-5(c)，先判定归属，再执行业务；以下既有业务语句顺序与语义不动。
+                    const gate = gateTerminal(msg);
+                    if (gate.kind === 'undecided') {
+                        if (markForegroundUndecided()) {
+                            perfLog('terminal_nil_undecided', 'type=task_stopped');
+                            log('收到无身份终态，当前任务状态无法确定');
+                        } else {
+                            perfLog('terminal_nil_no_identity', 'type=task_stopped');
+                        }
+                        break;
+                    }
+                    if (gate.kind === 'background') {
+                        if (confirmBackgroundTerminalReceipt(gate.record)) perfLog('terminal_background_confirmed', 'type=task_stopped task=' + gate.record.taskId);
+                        break;
+                    }
+                    if (gate.kind === 'duplicate') {
+                        perfLog('terminal_duplicate_discarded', 'type=task_stopped task=' + ((msg.data && msg.data.taskId) || ''));
+                        break;
+                    }
+                    if (gate.kind === 'discard') {
+                        perfLog(gate.reason === 'unknown_identity' ? 'late_terminal_discarded_unknown_identity' : 'terminal_malformed_discarded', 'type=task_stopped reason=' + gate.reason + ' task=' + ((msg.data && msg.data.taskId) || ''));
+                        break;
+                    }
+                    // 前台匹配：6 项检查 + 原子提交收据；任一不成立则整个提交不发生，不执行业务。
+                    if (!confirmForegroundTerminalReceipt(msg.data, 'task_stopped')) {
+                        perfLog('terminal_receipt_rejected', 'type=task_stopped');
+                        break;
+                    }
+                    // 非重放中：身份终结——清空前台身份、失效前台令牌、停 F-2；收据已在单例中保留。
+                    // 重放中（replaying）：身份/令牌/定时器保留，不执行 idle 清理（状态机 §2.2 A1）。
+                    if (replayState !== 'requesting' && replayState !== 'replaying') {
+                        foregroundTaskIdentity = null;
+                        currentRecoveryToken = null;
+                        stopF2Timers();
+                    }
                     if (nsbStopHandledByComplete) {
                         nsbStopHandledByComplete = false;
                         break;
@@ -6567,6 +9213,7 @@
                     resetStoppedTaskUI('已手动终止');
                     log('任务已手动终止');
                     break;
+                }
 
                 case 'error':
                     recordWebDebugError('server_error', msg.data);
@@ -6662,7 +9309,42 @@
                 case 'log':
                     log(msg.data);
                     break;
-                case 'task_complete':
+                case 'task_complete': {
+                    // S7 C3 P1：D-γ 门控 + D-5(c)，先判定归属，再执行业务；以下既有业务语句顺序与语义不动。
+                    const gate = gateTerminal(msg);
+                    if (gate.kind === 'undecided') {
+                        if (markForegroundUndecided()) {
+                            perfLog('terminal_nil_undecided', 'type=task_complete');
+                            log('收到无身份终态，当前任务状态无法确定');
+                        } else {
+                            perfLog('terminal_nil_no_identity', 'type=task_complete');
+                        }
+                        break;
+                    }
+                    if (gate.kind === 'background') {
+                        if (confirmBackgroundTerminalReceipt(gate.record)) perfLog('terminal_background_confirmed', 'type=task_complete task=' + gate.record.taskId);
+                        break;
+                    }
+                    if (gate.kind === 'duplicate') {
+                        perfLog('terminal_duplicate_discarded', 'type=task_complete task=' + ((msg.data && msg.data.taskId) || ''));
+                        break;
+                    }
+                    if (gate.kind === 'discard') {
+                        perfLog(gate.reason === 'unknown_identity' ? 'late_terminal_discarded_unknown_identity' : 'terminal_malformed_discarded', 'type=task_complete reason=' + gate.reason + ' task=' + ((msg.data && msg.data.taskId) || ''));
+                        break;
+                    }
+                    // 前台匹配：6 项检查 + 原子提交收据；任一不成立则整个提交不发生，不执行业务。
+                    if (!confirmForegroundTerminalReceipt(msg.data, 'task_complete')) {
+                        perfLog('terminal_receipt_rejected', 'type=task_complete');
+                        break;
+                    }
+                    // 非重放中：身份终结——清空前台身份、失效前台令牌、停 F-2；收据已在单例中保留。
+                    // 重放中（replaying）：身份/令牌/定时器保留，不执行 idle 清理（状态机 §2.2 A1）。
+                    if (replayState !== 'requesting' && replayState !== 'replaying') {
+                        foregroundTaskIdentity = null;
+                        currentRecoveryToken = null;
+                        stopF2Timers();
+                    }
                     if (isStoppingTask) {
                         resetStoppedTaskUI('已手动终止');
                         log('任务已手动终止');
@@ -6691,6 +9373,7 @@
                         }, 100);
                     }
                     break;
+                }
             }
         }
 
@@ -6732,6 +9415,7 @@
         }
 
         window.addEventListener('DOMContentLoaded', () => {
+            perfLog('page_dom_content_loaded', '');
             connect();
             initializeUI();
             renderGitHubAccounts();

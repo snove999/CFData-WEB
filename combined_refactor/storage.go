@@ -58,11 +58,21 @@ func initLocations() {
 		return
 	}
 
-	locationMap = make(map[string]location)
+	newLocationMap := make(map[string]location, len(locations))
 	for _, loc := range locations {
-		locationMap[loc.Iata] = loc
+		newLocationMap[loc.Iata] = loc
 	}
-	fmt.Printf("已加载 %d 个数据中心位置信息\n", len(locationMap))
+	locationMapMu.Lock()
+	locationMap = newLocationMap
+	locationMapMu.Unlock()
+	fmt.Printf("已加载 %d 个数据中心位置信息\n", len(newLocationMap))
+}
+
+func lookupLocation(dataCenter string) location {
+	locationMapMu.RLock()
+	loc := locationMap[dataCenter]
+	locationMapMu.RUnlock()
+	return loc
 }
 
 func sendLog(msg string) {

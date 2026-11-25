@@ -208,7 +208,7 @@ func scanNSBEntryHTTP(ctx context.Context, item string, fallbackPort int, enable
 		return nil, &nsbFailureRecord{index: inputIndex, ipAddr: ipAddr, port: portStr, phase: "scan", reason: "数据中心不匹配", detail: fmt.Sprintf("colo=%s, target=%s", dataCenter, targetDC)}
 	}
 
-	loc := locationMap[dataCenter]
+	loc := lookupLocation(dataCenter)
 	asnNumber, asnOrg := lookupASN(trace["ip"])
 	return &iptestResult{
 		ipAddr:      ipAddr,
@@ -364,7 +364,7 @@ func scanNSBEntry(ctx context.Context, item string, fallbackPort int, enableTLS 
 		return nil, &nsbFailureRecord{index: inputIndex, ipAddr: ipAddr, port: portStr, phase: "scan", reason: "数据中心不匹配", detail: fmt.Sprintf("colo=%s, target=%s", dataCenter, targetDC)}
 	}
 
-	loc := locationMap[dataCenter]
+	loc := lookupLocation(dataCenter)
 	asnNumber, asnOrg := lookupASN(trace["ip"])
 	return &iptestResult{
 		ipAddr:      ipAddr,
@@ -785,7 +785,7 @@ func runNSBTask(ctx context.Context, session *appSession, fileName, fileContent,
 		nsbResults = append(nsbResults, *res)
 		accepted := len(nsbResults)
 		resMutex.Unlock()
-		session.sendWSMessage("nsb_scan_result", res.toNSBLiveMessage("", compact))
+		session.sendTaskResult(ctx, "nsb_scan_result", res.toNSBLiveMessage("", compact))
 		return accepted
 	})
 
@@ -843,7 +843,7 @@ func runNSBTask(ctx context.Context, session *appSession, fileName, fileContent,
 			reportNSBProgress(session, "speed", min(qualified, speedLimit), speedLimit, "测速中")
 		}, func(idx int, speedErr string) {
 			res := &nsbResults[idx]
-			session.sendWSMessage("nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
+			session.sendTaskResult(ctx, "nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
 			if debugMode && speedErr != "" {
 				failMutex.Lock()
 				failures = append(failures, nsbFailureRecord{
@@ -1064,7 +1064,7 @@ func runNSBReallinkTask(ctx context.Context, session *appSession, rows []nsbScan
 			reportNSBProgress(session, "speed", min(qualified, speedLimit), speedLimit, "测速中")
 		}, func(idx int, speedErr string) {
 			res := &results[idx]
-			session.sendWSMessage("nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
+			session.sendTaskResult(ctx, "nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
 		}, func(idx int) (float64, string) {
 			res := &results[idx]
 			return runNSBDownloadSpeed(ctx, res.ipAddr, res.port, enableTLS, speedURL)
@@ -1154,7 +1154,7 @@ func runNSBSpeedBatch(ctx context.Context, session *appSession, rows []nsbScanMe
 		reportNSBProgress(session, "speed", qualified, speedLimit, "测速中")
 	}, func(idx int, speedErr string) {
 		res := &results[idx]
-		session.sendWSMessage("nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
+		session.sendTaskResult(ctx, "nsb_scan_result", res.toNSBLiveMessage(res.speedText, compact))
 	}, func(idx int) (float64, string) {
 		res := &results[idx]
 		return runNSBDownloadSpeed(ctx, res.ipAddr, res.port, enableTLS, speedURL)
